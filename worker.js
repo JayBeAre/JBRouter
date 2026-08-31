@@ -1,22 +1,18 @@
+```js
 /*
   JBRouter — Cloudflare Worker
 
   - Claude/Anthropic-compatible /v1/messages endpoint
-  - Dynamic providers, pools and model-role mapping in KV
+  - Dynamic OpenAI-compatible providers, pools and model-role mapping in KV
   - Password-protected /admin panel
   - First login uses DEFAULT_ADMIN_PASSWORD and forces a change
   - PBKDF2 password hashing + session version invalidation
   - Optional bearer auth for /v1/messages, configurable in /admin
-  - Provider kinds: openai, gemini, anthropic
+  - OpenAI-compatible providers only
   - Per-provider API-key rotation
   - Custom provider headers
-  - NEW: cross-pool fallback chaining (pool.fallbackPoolId) — when
-    every entry in a pool fails (e.g. a shared free-tier quota is
-    exhausted across ALL models in that pool, which key/model
-    rotation alone can't fix), the router moves on to another
-    whole pool instead of giving up.
-  - NEW: Retry-After passthrough on total failure, so clients back
-    off sensibly instead of hammering an exhausted pool.
+  - Cross-pool fallback chaining (pool.fallbackPoolId)
+  - Retry-After passthrough on total failure
 */
 
 const DEFAULT_ADMIN_PASSWORD = "changeme123"; // CHANGE BEFORE DEPLOYING
@@ -24,7 +20,6 @@ const SESSION_TTL = 60 * 60 * 12;
 const MAX_FAILED = 5;
 const LOCK_MS = 5 * 60 * 1000;
 const COOKIE = "admin_session";
-
 
 const K = {
   auth: "config:auth",
@@ -39,22 +34,8 @@ const DEFAULT_PROVIDERS = {
   "avalai-deepseek": {
     id: "avalai-deepseek",
     label: "AvalAI — DeepSeek V4 Flash",
-    kind: "openai",
     baseUrl: "https://api.avalai.ir/v1/chat/completions",
     cfAigToken: "",
-    anthropicVersion: "",
-    extraHeaders: {},
-    apiKeys: []
-  },
-
-  "gemini-gateway": {
-    id: "gemini-gateway",
-    label: "Gemini via Cloudflare AI Gateway",
-    kind: "gemini",
-    baseUrl:
-      "https://gateway.ai.cloudflare.com/v1/4bddba13f2ca2e21c9f3d73f2d00de97/ali-gemini-proxy/google-ai-studio",
-    cfAigToken: "",
-    anthropicVersion: "",
     extraHeaders: {},
     apiKeys: []
   },
@@ -62,10 +43,8 @@ const DEFAULT_PROVIDERS = {
   "opencode-zen": {
     id: "opencode-zen",
     label: "OpenCode Zen (free)",
-    kind: "openai",
     baseUrl: "https://opencode.ai/zen/v1/chat/completions",
     cfAigToken: "",
-    anthropicVersion: "",
     extraHeaders: {},
     apiKeys: []
   }
@@ -89,16 +68,16 @@ const DEFAULT_POOLS = {
     label: "Sonnet Pool",
     entries: [
       {
-        providerId: "gemini-gateway",
-        model: "gemini-3.6-flash"
+        providerId: "opencode-zen",
+        model: "laguna-s-2.1-free"
       },
       {
-        providerId: "gemini-gateway",
-        model: "gemini-2.5-pro"
+        providerId: "opencode-zen",
+        model: "hy3-free"
       },
       {
-        providerId: "gemini-gateway",
-        model: "gemini-2.5-flash"
+        providerId: "opencode-zen",
+        model: "nemotron-3-ultra-free"
       }
     ],
     fallbackPoolId: ""
@@ -129,13 +108,11 @@ const DEFAULT_POOLS = {
         model: "nemotron-3-ultra-free"
       }
     ],
+
     /*
-     * OpenCode Zen's free models appear to share ONE rate-limit
-     * bucket across the whole account, not a bucket per model —
-     * so rotating between them does nothing once that shared
-     * quota is spent. Falling through to the (paid, working)
-     * Sonnet/Gemini pool means haiku-tier requests still get
-     * answered instead of erroring out.
+     * Free models may share one provider/account rate-limit.
+     * If every entry in this pool fails, the router can move
+     * to the configured fallback pool.
      */
     fallbackPoolId: "pool-sonnet"
   }
@@ -188,9 +165,11 @@ const aerr = (
 
 const b64 = (b) => {
   let x = "";
+
   for (const v of b) {
     x += String.fromCharCode(v);
   }
+
   return btoa(x);
 };
 
@@ -256,9 +235,6 @@ async function hashPassword(p, saltB64) {
   };
 }
 
-
-
-
 async function verifyPassword(p, h, s) {
   if (!h || !s) {
     return false;
@@ -279,8 +255,73 @@ async function auth(env) {
   return kvGet(env, K.auth, null);
 }
 
+/*
+ * Providers are OpenAI-compatible only.
+ *
+ * Old Gemini/Anthropic providers in KV are removed during
+ * migration so they cannot appear in the admin UI anymore.
+ *
+ * Existing providers are normalized to the OpenAI-only shape.
+ */
 async function providers(env) {
-  return kvGet(env, K.providers, DEFAULT_PROVIDERS);
+  const stored = await kvGet(
+    env,
+    K.providers,
+    DEFAULT_PROVIDERS
+  );
+
+  const ps = {};
+  let changed = false;
+
+  for (const id of Object.keys(stored || {})) {
+    const p = stored[id] || {};
+
+    /*
+     * Remove legacy non-OpenAI provider kinds.
+     */
+    if (
+      p.kind === "gemini" ||
+      p.kind === "anthropic"
+    ) {
+      changed = true;
+      continue;
+    }
+
+    const normalized = {
+      id: p.id || id,
+      label: p.label || id,
+      baseUrl: String(p.baseUrl || ""),
+      cfAigToken: String(p.cfAigToken || ""),
+      extraHeaders: cleanHeaders(
+        p.extraHeaders || {}
+      ),
+      apiKeys: Array.isArray(p.apiKeys)
+        ? p.apiKeys
+        : []
+    };
+
+    if (
+      p.kind !== undefined ||
+      p.anthropicVersion !== undefined
+    ) {
+      changed = true;
+    }
+
+    ps[id] = normalized;
+  }
+
+  /*
+   * Persist the cleaned provider configuration once.
+   */
+  if (changed) {
+    await kvPut(
+      env,
+      K.providers,
+      ps
+    );
+  }
+
+  return ps;
 }
 
 async function pools(env) {
@@ -300,8 +341,11 @@ async function routerAuth(env) {
 
 function cookie(request) {
   const c = request.headers.get("cookie") || "";
+
   const m = c.match(
-    new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`)
+    new RegExp(
+      `(?:^|;\\s*)${COOKIE}=([^;]+)`
+    )
   );
 
   return m ? m[1] : null;
@@ -316,7 +360,9 @@ function clearCookie() {
 }
 
 async function newSession(env) {
-  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const raw = crypto.getRandomValues(
+    new Uint8Array(32)
+  );
 
   const token = b64(raw).replace(
     /[^a-zA-Z0-9]/g,
@@ -325,18 +371,24 @@ async function newSession(env) {
 
   const ar = await auth(env);
 
-  const ver = Number.isInteger(ar?.sessionVersion)
+  const ver = Number.isInteger(
+    ar?.sessionVersion
+  )
     ? ar.sessionVersion
     : 0;
 
   await env.CONFIG_KV.put(
     K.session + token,
     JSON.stringify({
-      expires: Date.now() + SESSION_TTL * 1000,
+      expires:
+        Date.now() +
+        SESSION_TTL * 1000,
+
       sessionVersion: ver
     }),
     {
-      expirationTtl: SESSION_TTL
+      expirationTtl:
+        SESSION_TTL
     }
   );
 
@@ -357,15 +409,23 @@ async function validSession(request, env) {
 
   const ar = await auth(env);
 
-  if (!s || s.expires < Date.now()) {
+  if (
+    !s ||
+    s.expires < Date.now()
+  ) {
     return null;
   }
 
-  const ver = Number.isInteger(ar?.sessionVersion)
-    ? ar.sessionVersion
-    : 0;
+  const ver =
+    Number.isInteger(
+      ar?.sessionVersion
+    )
+      ? ar.sessionVersion
+      : 0;
 
-  return s.sessionVersion === ver ? t : null;
+  return s.sessionVersion === ver
+    ? t
+    : null;
 }
 
 function cleanHeaders(h) {
@@ -395,15 +455,20 @@ function redacted(ps) {
     o[id] = {
       id: p.id,
       label: p.label,
-      kind: p.kind,
       baseUrl: p.baseUrl,
-      hasCfAigToken: !!p.cfAigToken,
-      anthropicVersion: p.anthropicVersion || "",
-      extraHeaders: p.extraHeaders || {},
-      apiKeyCount: Array.isArray(p.apiKeys)
-        ? p.apiKeys.length
-        : 0,
-      apiKeysMasked: (p.apiKeys || []).map(mask)
+      hasCfAigToken:
+        !!p.cfAigToken,
+
+      extraHeaders:
+        p.extraHeaders || {},
+
+      apiKeyCount:
+        Array.isArray(p.apiKeys)
+          ? p.apiKeys.length
+          : 0,
+
+      apiKeysMasked:
+        (p.apiKeys || []).map(mask)
     };
   }
 
@@ -423,7 +488,10 @@ async function login(request, env) {
     return aerr("Invalid JSON body.");
   }
 
-  const p = String(body?.password || "");
+  const p = String(
+    body?.password || ""
+  );
+
   const ar = await auth(env);
   const now = Date.now();
 
@@ -431,21 +499,15 @@ async function login(request, env) {
     return j(
       {
         ok: false,
-        error: `Too many attempts. Try again in ${Math.ceil(
-          (ar.lockUntil - now) / 1000
-        )}s.`
+        error:
+          `Too many attempts. Try again in ${Math.ceil(
+            (ar.lockUntil - now) / 1000
+          )}s.`
       },
       429
     );
   }
 
-  /*
-   * IMPORTANT:
-   * A KV auth record may exist without a password hash because
-   * a previous first-login attempt was incorrect.
-   *
-   * Such a state is still treated as "first login".
-   */
   const fresh =
     !ar ||
     !ar.passwordHash ||
@@ -464,57 +526,88 @@ async function login(request, env) {
     : !!ar.mustChangePassword;
 
   if (!ok) {
-    const n = (ar?.failedAttempts || 0) + 1;
+    const n =
+      (ar?.failedAttempts || 0) +
+      1;
 
-    await kvPut(env, K.auth, {
-      ...(ar || {}),
-      passwordHash: ar?.passwordHash || null,
-      salt: ar?.salt || null,
-      mustChangePassword: true,
-      failedAttempts: n,
-      lockUntil:
-        n >= MAX_FAILED
-          ? now + LOCK_MS
-          : 0,
-      sessionVersion: Number.isInteger(
-        ar?.sessionVersion
-      )
-        ? ar.sessionVersion
-        : 0
-    });
+    await kvPut(
+      env,
+      K.auth,
+      {
+        ...(ar || {}),
+        passwordHash:
+          ar?.passwordHash ||
+          null,
+
+        salt:
+          ar?.salt ||
+          null,
+
+        mustChangePassword:
+          true,
+
+        failedAttempts:
+          n,
+
+        lockUntil:
+          n >= MAX_FAILED
+            ? now + LOCK_MS
+            : 0,
+
+        sessionVersion:
+          Number.isInteger(
+            ar?.sessionVersion
+          )
+            ? ar.sessionVersion
+            : 0
+      }
+    );
 
     return j(
       {
         ok: false,
-        error: "Invalid password."
+        error:
+          "Invalid password."
       },
       401
     );
   }
 
   if (ar) {
-    await kvPut(env, K.auth, {
-      ...ar,
-      failedAttempts: 0,
-      lockUntil: 0,
-      sessionVersion: Number.isInteger(
-        ar.sessionVersion
-      )
-        ? ar.sessionVersion
-        : 0
-    });
+    await kvPut(
+      env,
+      K.auth,
+      {
+        ...ar,
+        failedAttempts:
+          0,
+
+        lockUntil:
+          0,
+
+        sessionVersion:
+          Number.isInteger(
+            ar.sessionVersion
+          )
+            ? ar.sessionVersion
+            : 0
+      }
+    );
   }
 
-  const token = await newSession(env);
+  const token =
+    await newSession(env);
 
   return j(
     {
       ok: true,
-      mustChangePassword: must
+      mustChangePassword:
+        must
     },
     200,
     {
-      "Set-Cookie": setCookie(token)
+      "Set-Cookie":
+        setCookie(token)
     }
   );
 }
@@ -523,17 +616,27 @@ async function login(request, env) {
    PASSWORD CHANGE
    ============================================================ */
 
-async function changePassword(request, env) {
+async function changePassword(
+  request,
+  env
+) {
   let b;
 
   try {
     b = await request.json();
   } catch {
-    return aerr("Invalid JSON body.");
+    return aerr(
+      "Invalid JSON body."
+    );
   }
 
-  const cur = String(b?.currentPassword || "");
-  const next = String(b?.newPassword || "");
+  const cur = String(
+    b?.currentPassword || ""
+  );
+
+  const next = String(
+    b?.newPassword || ""
+  );
 
   if (next.length < 8) {
     return j(
@@ -546,11 +649,14 @@ async function changePassword(request, env) {
     );
   }
 
-  const ar = await auth(env);
+  const ar =
+    await auth(env);
 
   const ok =
-    !ar || !ar.passwordHash
-      ? cur === DEFAULT_ADMIN_PASSWORD
+    !ar ||
+    !ar.passwordHash
+      ? cur ===
+        DEFAULT_ADMIN_PASSWORD
       : await verifyPassword(
           cur,
           ar.passwordHash,
@@ -561,37 +667,49 @@ async function changePassword(request, env) {
     return j(
       {
         ok: false,
-        error: "Current password is incorrect."
+        error:
+          "Current password is incorrect."
       },
       401
     );
   }
 
-  const hs = await hashPassword(next);
+  const hs =
+    await hashPassword(next);
 
-  /*
-   * Incrementing sessionVersion invalidates ALL previously
-   * issued admin sessions.
-   */
   const ver =
-    (Number.isInteger(ar?.sessionVersion)
+    (Number.isInteger(
+      ar?.sessionVersion
+    )
       ? ar.sessionVersion
       : 0) + 1;
 
-  await kvPut(env, K.auth, {
-    passwordHash: hs.hash,
-    salt: hs.salt,
-    mustChangePassword: false,
-    failedAttempts: 0,
-    lockUntil: 0,
-    sessionVersion: ver
-  });
+  await kvPut(
+    env,
+    K.auth,
+    {
+      passwordHash:
+        hs.hash,
 
-  /*
-   * Immediately create a fresh session for the browser which
-   * just changed the password.
-   */
-  const token = await newSession(env);
+      salt:
+        hs.salt,
+
+      mustChangePassword:
+        false,
+
+      failedAttempts:
+        0,
+
+      lockUntil:
+        0,
+
+      sessionVersion:
+        ver
+    }
+  );
+
+  const token =
+    await newSession(env);
 
   return j(
     {
@@ -599,13 +717,15 @@ async function changePassword(request, env) {
     },
     200,
     {
-      "Set-Cookie": setCookie(token)
+      "Set-Cookie":
+        setCookie(token)
     }
   );
 }
 
 async function requireChanged(env) {
-  const ar = await auth(env);
+  const ar =
+    await auth(env);
 
   return (
     !!ar?.passwordHash &&
@@ -617,8 +737,13 @@ async function requireChanged(env) {
    PROVIDERS
    ============================================================ */
 
-async function saveProvider(request, env) {
-  if (!(await requireChanged(env))) {
+async function saveProvider(
+  request,
+  env
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -631,72 +756,99 @@ async function saveProvider(request, env) {
   try {
     b = await request.json();
   } catch {
-    return aerr("Invalid JSON body.");
+    return aerr(
+      "Invalid JSON body."
+    );
   }
 
-  const ps = await providers(env);
+  const ps =
+    await providers(env);
 
   const id =
-    String(b.id || "").trim() ||
+    String(
+      b.id || ""
+    ).trim() ||
     `provider-${crypto.randomUUID().slice(0, 8)}`;
 
-  const old = ps[id] || {};
+  const old =
+    ps[id] || {};
 
-  const kind = [
-    "openai",
-    "gemini",
-    "anthropic"
-  ].includes(b.kind)
-    ? b.kind
-    : "openai";
-
-  let keys = Array.isArray(old.apiKeys)
-    ? old.apiKeys
-    : [];
+  let keys =
+    Array.isArray(
+      old.apiKeys
+    )
+      ? old.apiKeys
+      : [];
 
   if (
-    typeof b.apiKeysRaw === "string" &&
+    typeof b.apiKeysRaw ===
+      "string" &&
     b.apiKeysRaw.trim()
   ) {
-    keys = b.apiKeysRaw
-      .split(/[\n,]/)
-      .map((x) => x.trim())
-      .filter(Boolean);
-  } else if (b.clearApiKeys === true) {
+    keys =
+      b.apiKeysRaw
+        .split(/[\n,]/)
+        .map(
+          (x) =>
+            x.trim()
+        )
+        .filter(Boolean);
+  }
+
+  else if (
+    b.clearApiKeys ===
+    true
+  ) {
     keys = [];
   }
 
+  /*
+   * Every provider is OpenAI-compatible.
+   * There is deliberately no provider-kind selector.
+   */
   ps[id] = {
     id,
-    label: String(b.label || id),
-    kind,
-    baseUrl: String(b.baseUrl || ""),
+
+    label:
+      String(
+        b.label ||
+        id
+      ),
+
+    baseUrl:
+      String(
+        b.baseUrl ||
+        ""
+      ),
 
     cfAigToken:
-      typeof b.cfAigToken === "string" &&
+      typeof b.cfAigToken ===
+        "string" &&
       b.cfAigToken.length
         ? b.cfAigToken
         : b.clearCfAigToken
         ? ""
-        : old.cfAigToken || "",
+        : old.cfAigToken ||
+          "",
 
-    anthropicVersion:
-      String(
-        b.anthropicVersion ||
-          old.anthropicVersion ||
-          ""
+    extraHeaders:
+      cleanHeaders(
+        b.extraHeaders !==
+          undefined
+          ? b.extraHeaders
+          : old.extraHeaders ||
+            {}
       ),
 
-    extraHeaders: cleanHeaders(
-      b.extraHeaders !== undefined
-        ? b.extraHeaders
-        : old.extraHeaders || {}
-    ),
-
-    apiKeys: keys
+    apiKeys:
+      keys
   };
 
-  await kvPut(env, K.providers, ps);
+  await kvPut(
+    env,
+    K.providers,
+    ps
+  );
 
   return j({
     ok: true,
@@ -704,8 +856,13 @@ async function saveProvider(request, env) {
   });
 }
 
-async function deleteProvider(env, id) {
-  if (!(await requireChanged(env))) {
+async function deleteProvider(
+  env,
+  id
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -713,11 +870,16 @@ async function deleteProvider(env, id) {
     );
   }
 
-  const ps = await providers(env);
+  const ps =
+    await providers(env);
 
   delete ps[id];
 
-  await kvPut(env, K.providers, ps);
+  await kvPut(
+    env,
+    K.providers,
+    ps
+  );
 
   return j({
     ok: true
@@ -728,8 +890,13 @@ async function deleteProvider(env, id) {
    POOLS
    ============================================================ */
 
-async function savePool(request, env) {
-  if (!(await requireChanged(env))) {
+async function savePool(
+  request,
+  env
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -742,37 +909,69 @@ async function savePool(request, env) {
   try {
     b = await request.json();
   } catch {
-    return aerr("Invalid JSON body.");
+    return aerr(
+      "Invalid JSON body."
+    );
   }
 
-  const pl = await pools(env);
+  const pl =
+    await pools(env);
 
   const id =
-    String(b.id || "").trim() ||
+    String(
+      b.id || ""
+    ).trim() ||
     `pool-${crypto.randomUUID().slice(0, 8)}`;
 
-  const entries = Array.isArray(b.entries)
-    ? b.entries
-        .filter(
-          (e) =>
-            e &&
-            e.providerId &&
-            e.model
-        )
-        .map((e) => ({
-          providerId: String(e.providerId),
-          model: String(e.model)
-        }))
-    : [];
+  const entries =
+    Array.isArray(
+      b.entries
+    )
+      ? b.entries
+          .filter(
+            (e) =>
+              e &&
+              e.providerId &&
+              e.model
+          )
+          .map(
+            (e) => ({
+              providerId:
+                String(
+                  e.providerId
+                ),
+
+              model:
+                String(
+                  e.model
+                )
+            })
+          )
+      : [];
 
   pl[id] = {
     id,
-    label: String(b.label || id),
+
+    label:
+      String(
+        b.label ||
+        id
+      ),
+
     entries,
-    fallbackPoolId: String(b.fallbackPoolId || "")
+
+    fallbackPoolId:
+      String(
+        b.fallbackPoolId ||
+        ""
+      )
   };
 
-  await kvPut(env, K.pools, pl);
+  await kvPut(
+    env,
+    K.pools,
+    pl
+  );
 
   return j({
     ok: true,
@@ -780,8 +979,13 @@ async function savePool(request, env) {
   });
 }
 
-async function deletePool(env, id) {
-  if (!(await requireChanged(env))) {
+async function deletePool(
+  env,
+  id
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -789,34 +993,60 @@ async function deletePool(env, id) {
     );
   }
 
-  const pl = await pools(env);
+  const pl =
+    await pools(env);
 
   delete pl[id];
 
-  /*
-   * Clean up any pools that pointed their fallback at the one
-   * we just deleted, so we never reference a dangling pool id.
-   */
-  for (const otherId of Object.keys(pl)) {
-    if (pl[otherId].fallbackPoolId === id) {
-      pl[otherId] = { ...pl[otherId], fallbackPoolId: "" };
+  for (
+    const otherId of
+      Object.keys(pl)
+  ) {
+    if (
+      pl[otherId]
+        .fallbackPoolId ===
+      id
+    ) {
+      pl[otherId] = {
+        ...pl[otherId],
+        fallbackPoolId:
+          ""
+      };
     }
   }
 
-  await kvPut(env, K.pools, pl);
-
-  const rm = await rolemap(env);
-
-  rm.rules = (rm.rules || []).filter(
-    (r) => r.poolId !== id
+  await kvPut(
+    env,
+    K.pools,
+    pl
   );
 
-  if (rm.defaultPoolId === id) {
+  const rm =
+    await rolemap(env);
+
+  rm.rules =
+    (
+      rm.rules ||
+      []
+    ).filter(
+      (r) =>
+        r.poolId !== id
+    );
+
+  if (
+    rm.defaultPoolId ===
+    id
+  ) {
     rm.defaultPoolId =
-      Object.keys(pl)[0] || "";
+      Object.keys(pl)[0] ||
+      "";
   }
 
-  await kvPut(env, K.rolemap, rm);
+  await kvPut(
+    env,
+    K.rolemap,
+    rm
+  );
 
   return j({
     ok: true
@@ -827,8 +1057,13 @@ async function deletePool(env, id) {
    ROLE MAP
    ============================================================ */
 
-async function saveRoleMap(request, env) {
-  if (!(await requireChanged(env))) {
+async function saveRoleMap(
+  request,
+  env
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -841,32 +1076,50 @@ async function saveRoleMap(request, env) {
   try {
     b = await request.json();
   } catch {
-    return aerr("Invalid JSON body.");
+    return aerr(
+      "Invalid JSON body."
+    );
   }
 
   const rm = {
-    rules: Array.isArray(b.rules)
-      ? b.rules
-          .filter(
-            (r) =>
-              r &&
-              r.keyword &&
-              r.poolId
-          )
-          .map((r) => ({
-            keyword: String(
-              r.keyword
-            ).toLowerCase(),
-            poolId: String(r.poolId)
-          }))
-      : [],
+    rules:
+      Array.isArray(
+        b.rules
+      )
+        ? b.rules
+            .filter(
+              (r) =>
+                r &&
+                r.keyword &&
+                r.poolId
+            )
+            .map(
+              (r) => ({
+                keyword:
+                  String(
+                    r.keyword
+                  ).toLowerCase(),
 
-    defaultPoolId: String(
-      b.defaultPoolId || ""
-    )
+                poolId:
+                  String(
+                    r.poolId
+                  )
+              })
+            )
+        : [],
+
+    defaultPoolId:
+      String(
+        b.defaultPoolId ||
+        ""
+      )
   };
 
-  await kvPut(env, K.rolemap, rm);
+  await kvPut(
+    env,
+    K.rolemap,
+    rm
+  );
 
   return j({
     ok: true
@@ -877,8 +1130,13 @@ async function saveRoleMap(request, env) {
    ROUTER AUTH
    ============================================================ */
 
-async function saveRouterAuth(request, env) {
-  if (!(await requireChanged(env))) {
+async function saveRouterAuth(
+  request,
+  env
+) {
+  if (
+    !(await requireChanged(env))
+  ) {
     return aerr(
       "Change your password before editing configuration.",
       "authentication_error",
@@ -891,15 +1149,23 @@ async function saveRouterAuth(request, env) {
   try {
     b = await request.json();
   } catch {
-    return aerr("Invalid JSON body.");
+    return aerr(
+      "Invalid JSON body."
+    );
   }
 
-  const enabled = !!b.enabled;
-  const token = String(
-    b.token || ""
-  ).trim();
+  const enabled =
+    !!b.enabled;
 
-  if (enabled && token.length < 32) {
+  const token =
+    String(
+      b.token || ""
+    ).trim();
+
+  if (
+    enabled &&
+    token.length < 32
+  ) {
     return j(
       {
         ok: false,
@@ -910,10 +1176,14 @@ async function saveRouterAuth(request, env) {
     );
   }
 
-  await kvPut(env, K.routerAuth, {
-    enabled,
-    token
-  });
+  await kvPut(
+    env,
+    K.routerAuth,
+    {
+      enabled,
+      token
+    }
+  );
 
   return j({
     ok: true,
@@ -926,10 +1196,16 @@ async function saveRouterAuth(request, env) {
    ADMIN ROUTER
    ============================================================ */
 
-async function admin(request, env, url) {
+async function admin(
+  request,
+  env,
+  url
+) {
   if (
-    url.pathname === "/admin" &&
-    request.method === "GET"
+    url.pathname ===
+      "/admin" &&
+    request.method ===
+      "GET"
   ) {
     return new Response(
       ADMIN_HTML,
@@ -945,21 +1221,27 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/login" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
-    return login(request, env);
+    return login(
+      request,
+      env
+    );
   }
 
-  const s = await validSession(
-    request,
-    env
-  );
+  const s =
+    await validSession(
+      request,
+      env
+    );
 
   if (!s) {
     return j(
       {
         ok: false,
-        error: "Not authenticated."
+        error:
+          "Not authenticated."
       },
       401
     );
@@ -968,7 +1250,8 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/logout" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     await env.CONFIG_KV.delete(
       K.session + s
@@ -980,7 +1263,8 @@ async function admin(request, env, url) {
       },
       200,
       {
-        "Set-Cookie": clearCookie()
+        "Set-Cookie":
+          clearCookie()
       }
     );
   }
@@ -988,7 +1272,8 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/change-password" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     return changePassword(
       request,
@@ -999,9 +1284,11 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/state" &&
-    request.method === "GET"
+    request.method ===
+      "GET"
   ) {
-    const ar = await auth(env);
+    const ar =
+      await auth(env);
 
     const [
       ps,
@@ -1020,17 +1307,25 @@ async function admin(request, env, url) {
         !ar?.passwordHash ||
         !!ar?.mustChangePassword,
 
-      providers: redacted(ps),
-      pools: pl,
-      roleMap: rm,
-      routerAuth: ra
+      providers:
+        redacted(ps),
+
+      pools:
+        pl,
+
+      roleMap:
+        rm,
+
+      routerAuth:
+        ra
     });
   }
 
   if (
     url.pathname ===
       "/admin/api/providers" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     return saveProvider(
       request,
@@ -1042,12 +1337,15 @@ async function admin(request, env, url) {
     url.pathname.startsWith(
       "/admin/api/providers/"
     ) &&
-    request.method === "DELETE"
+    request.method ===
+      "DELETE"
   ) {
     return deleteProvider(
       env,
       decodeURIComponent(
-        url.pathname.split("/").pop()
+        url.pathname
+          .split("/")
+          .pop()
       )
     );
   }
@@ -1055,7 +1353,8 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/pools" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     return savePool(
       request,
@@ -1067,12 +1366,15 @@ async function admin(request, env, url) {
     url.pathname.startsWith(
       "/admin/api/pools/"
     ) &&
-    request.method === "DELETE"
+    request.method ===
+      "DELETE"
   ) {
     return deletePool(
       env,
       decodeURIComponent(
-        url.pathname.split("/").pop()
+        url.pathname
+          .split("/")
+          .pop()
       )
     );
   }
@@ -1080,7 +1382,8 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/rolemap" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     return saveRoleMap(
       request,
@@ -1091,7 +1394,8 @@ async function admin(request, env, url) {
   if (
     url.pathname ===
       "/admin/api/router-auth" &&
-    request.method === "POST"
+    request.method ===
+      "POST"
   ) {
     return saveRouterAuth(
       request,
@@ -1111,41 +1415,22 @@ async function admin(request, env, url) {
    CLAUDE / OPENAI CONVERSION
    ============================================================ */
 
-function systemText(s) {
-  if (!s) {
-    return "";
-  }
-
-  if (typeof s === "string") {
-    return s;
-  }
-
-  if (Array.isArray(s)) {
-    return s
-      .map((p) =>
-        typeof p === "string"
-          ? p
-          : p?.type === "text"
-          ? p.text || ""
-          : ""
-      )
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  return String(s);
-}
-
 function blockText(p) {
   if (!p) {
     return "";
   }
 
-  if (p.type === "text") {
+  if (
+    p.type ===
+    "text"
+  ) {
     return p.text || "";
   }
 
-  if (p.type === "image") {
+  if (
+    p.type ===
+    "image"
+  ) {
     return "[image content]";
   }
 
@@ -1155,45 +1440,76 @@ function blockText(p) {
 function toOpenAIMessages(ms) {
   const out = [];
 
-  for (const m of ms || []) {
-    if (typeof m.content === "string") {
+  for (
+    const m of ms || []
+  ) {
+    if (
+      typeof m.content ===
+      "string"
+    ) {
       out.push({
-        role: m.role,
-        content: m.content
+        role:
+          m.role,
+
+        content:
+          m.content
       });
 
       continue;
     }
 
-    if (!Array.isArray(m.content)) {
+    if (
+      !Array.isArray(
+        m.content
+      )
+    ) {
       out.push({
-        role: m.role,
-        content: String(
-          m.content ?? ""
-        )
+        role:
+          m.role,
+
+        content:
+          String(
+            m.content ??
+            ""
+          )
       });
 
       continue;
     }
 
-    if (m.role === "user") {
+    if (
+      m.role ===
+      "user"
+    ) {
       const t = [];
       const tr = [];
 
-      for (const p of m.content || []) {
+      for (
+        const p of
+          m.content ||
+          []
+      ) {
         if (!p) {
           continue;
         }
 
-        if (p.type === "text") {
-          t.push(p.text || "");
+        if (
+          p.type ===
+          "text"
+        ) {
+          t.push(
+            p.text || ""
+          );
         }
 
         else if (
-          p.type === "tool_result"
+          p.type ===
+          "tool_result"
         ) {
           tr.push({
-            role: "tool",
+            role:
+              "tool",
+
             tool_call_id:
               p.tool_use_id,
 
@@ -1202,20 +1518,26 @@ function toOpenAIMessages(ms) {
               "string"
                 ? p.content
                 : JSON.stringify(
-                    p.content ?? ""
+                    p.content ??
+                    ""
                   )
           });
         }
 
         else {
-          t.push(blockText(p));
+          t.push(
+            blockText(p)
+          );
         }
       }
 
       if (t.length) {
         out.push({
-          role: "user",
-          content: t.join("\n")
+          role:
+            "user",
+
+          content:
+            t.join("\n")
         });
       }
 
@@ -1224,47 +1546,67 @@ function toOpenAIMessages(ms) {
       continue;
     }
 
-    if (m.role === "assistant") {
+    if (
+      m.role ===
+      "assistant"
+    ) {
       const t = [];
       const tc = [];
 
-      for (const p of m.content || []) {
+      for (
+        const p of
+          m.content ||
+          []
+      ) {
         if (!p) {
           continue;
         }
 
-        if (p.type === "text") {
-          t.push(p.text || "");
+        if (
+          p.type ===
+          "text"
+        ) {
+          t.push(
+            p.text || ""
+          );
         }
 
         else if (
-          p.type === "tool_use"
+          p.type ===
+          "tool_use"
         ) {
           tc.push({
             id:
               p.id ||
               `tool_${crypto.randomUUID()}`,
 
-            type: "function",
+            type:
+              "function",
 
             function: {
-              name: p.name || "",
+              name:
+                p.name || "",
 
               arguments:
                 JSON.stringify(
-                  p.input ?? {}
+                  p.input ??
+                  {}
                 )
             }
           });
         }
 
         else {
-          t.push(blockText(p));
+          t.push(
+            blockText(p)
+          );
         }
       }
 
       const x = {
-        role: "assistant",
+        role:
+          "assistant",
+
         content:
           t.length
             ? t.join("\n")
@@ -1272,7 +1614,8 @@ function toOpenAIMessages(ms) {
       };
 
       if (tc.length) {
-        x.tool_calls = tc;
+        x.tool_calls =
+          tc;
       }
 
       out.push(x);
@@ -1281,9 +1624,13 @@ function toOpenAIMessages(ms) {
     }
 
     out.push({
-      role: m.role,
+      role:
+        m.role,
+
       content:
-        JSON.stringify(m.content)
+        JSON.stringify(
+          m.content
+        )
     });
   }
 
@@ -1291,29 +1638,42 @@ function toOpenAIMessages(ms) {
 }
 
 function toOpenAITools(ts) {
-  if (!Array.isArray(ts)) {
+  if (
+    !Array.isArray(ts)
+  ) {
     return undefined;
   }
 
   return ts
     .filter(
-      (t) => t && t.name
+      (t) =>
+        t &&
+        t.name
     )
-    .map((t) => ({
-      type: "function",
+    .map(
+      (t) => ({
+        type:
+          "function",
 
-      function: {
-        name: t.name,
-        description:
-          t.description || "",
+        function: {
+          name:
+            t.name,
 
-        parameters:
-          t.input_schema || {
-            type: "object",
-            properties: {}
-          }
-      }
-    }));
+          description:
+            t.description ||
+            "",
+
+          parameters:
+            t.input_schema || {
+              type:
+                "object",
+
+              properties:
+                {}
+            }
+        }
+      })
+    );
 }
 
 function toolChoice(x) {
@@ -1321,22 +1681,32 @@ function toolChoice(x) {
     return undefined;
   }
 
-  if (x.type === "auto") {
+  if (
+    x.type ===
+    "auto"
+  ) {
     return "auto";
   }
 
-  if (x.type === "any") {
+  if (
+    x.type ===
+    "any"
+  ) {
     return "required";
   }
 
   if (
-    x.type === "tool" &&
+    x.type ===
+      "tool" &&
     x.name
   ) {
     return {
-      type: "function",
+      type:
+        "function",
+
       function: {
-        name: x.name
+        name:
+          x.name
       }
     };
   }
@@ -1356,14 +1726,22 @@ function textFromOpenAI(m) {
     return m.content;
   }
 
-  if (Array.isArray(m.content)) {
+  if (
+    Array.isArray(
+      m.content
+    )
+  ) {
     return m.content
-      .map((x) =>
-        typeof x === "string"
-          ? x
-          : x?.type === "text"
-          ? x.text || ""
-          : ""
+      .map(
+        (x) =>
+          typeof x ===
+          "string"
+            ? x
+            : x?.type ===
+              "text"
+            ? x.text ||
+              ""
+            : ""
       )
       .join("");
   }
@@ -1385,66 +1763,87 @@ function fromOpenAI(
     );
   }
 
-const m =
-  c.message || {};
+  const m =
+    c.message || {};
 
-const hasText =
-  typeof m.content === "string"
-    ? m.content.length > 0
-    : Array.isArray(m.content) &&
-      m.content.some(
-        (x) =>
-          typeof x === "string"
-            ? x.length > 0
-            : x?.type === "text" &&
-              typeof x.text === "string" &&
-              x.text.length > 0
-      );
+  const hasText =
+    typeof m.content ===
+    "string"
+      ? m.content.length >
+        0
+      : Array.isArray(
+          m.content
+        ) &&
+        m.content.some(
+          (x) =>
+            typeof x ===
+            "string"
+              ? x.length >
+                0
+              : x?.type ===
+                  "text" &&
+                typeof x.text ===
+                  "string" &&
+                x.text.length >
+                  0
+        );
 
-const hasTools =
-  Array.isArray(m.tool_calls) &&
-  m.tool_calls.length > 0;
+  const hasTools =
+    Array.isArray(
+      m.tool_calls
+    ) &&
+    m.tool_calls.length >
+      0;
 
-if (!hasText && !hasTools) {
-  throw Error(
-    "Provider returned an empty assistant response."
-  );
-}
+  if (
+    !hasText &&
+    !hasTools
+  ) {
+    throw Error(
+      "Provider returned an empty assistant response."
+    );
+  }
 
-const content = [];
+  const content = [];
 
   const t =
     textFromOpenAI(m);
 
   if (t) {
     content.push({
-      type: "text",
-      text: t
+      type:
+        "text",
+
+      text:
+        t
     });
   }
 
   for (
     const tc of
-      m.tool_calls || []
+      m.tool_calls ||
+      []
   ) {
     let input = {};
 
     try {
       input = JSON.parse(
         tc?.function?.arguments ||
-          "{}"
+        "{}"
       );
     } catch {}
 
     content.push({
-      type: "tool_use",
+      type:
+        "tool_use",
 
       id:
         tc.id ||
         `tool_${crypto.randomUUID()}`,
 
       name:
-        tc?.function?.name || "",
+        tc?.function?.name ||
+        "",
 
       input
     });
@@ -1455,9 +1854,15 @@ const content = [];
       r.id ||
       `msg_${crypto.randomUUID()}`,
 
-    type: "message",
-    role: "assistant",
-    model: requested,
+    type:
+      "message",
+
+    role:
+      "assistant",
+
+    model:
+      requested,
+
     content,
 
     stop_reason:
@@ -1465,284 +1870,27 @@ const content = [];
       "tool_calls"
         ? "tool_use"
         : c.finish_reason ===
-          "length"
+            "length"
         ? "max_tokens"
         : "end_turn",
 
-    stop_sequence: null,
+    stop_sequence:
+      null,
 
     usage: {
       input_tokens:
-        r?.usage?.prompt_tokens ||
+        r?.usage
+          ?.prompt_tokens ||
         0,
 
       output_tokens:
-        r?.usage?.completion_tokens ||
+        r?.usage
+          ?.completion_tokens ||
         0
     },
 
     _backend_model:
       backend
-  };
-}
-
-/* ============================================================
-   GEMINI
-   ============================================================ */
-
-function geminiMessages(ms) {
-  const out = [];
-
-  for (const m of ms || []) {
-    const c = m.content;
-
-    if (typeof c === "string") {
-      out.push({
-        role:
-          m.role === "assistant"
-            ? "model"
-            : "user",
-
-        parts: [
-          {
-            text: c
-          }
-        ]
-      });
-
-      continue;
-    }
-
-    if (!Array.isArray(c)) {
-      continue;
-    }
-
-    if (m.role === "user") {
-      const parts = [];
-
-      for (
-        const p of c
-      ) {
-        if (!p) {
-          continue;
-        }
-
-        if (p.type === "text") {
-          parts.push({
-            text: p.text || ""
-          });
-        }
-
-        else if (
-          p.type ===
-          "tool_result"
-        ) {
-          parts.push({
-            functionResponse: {
-              name:
-                p.name ||
-                p.tool_use_id ||
-                "tool",
-
-              response: {
-                result:
-                  typeof p.content ===
-                  "string"
-                    ? p.content
-                    : JSON.stringify(
-                        p.content ??
-                          ""
-                      )
-              }
-            }
-          });
-        }
-
-        else if (
-          p.type === "image"
-        ) {
-          parts.push({
-            text: "[image content]"
-          });
-        }
-      }
-
-      if (parts.length) {
-        out.push({
-          role: "user",
-          parts
-        });
-      }
-    }
-
-    else if (
-      m.role ===
-      "assistant"
-    ) {
-      const parts = [];
-
-      for (
-        const p of c
-      ) {
-        if (!p) {
-          continue;
-        }
-
-        if (p.type === "text") {
-          parts.push({
-            text: p.text || ""
-          });
-        }
-
-        else if (
-          p.type ===
-          "tool_use"
-        ) {
-          parts.push({
-            functionCall: {
-              name: p.name,
-              args:
-                p.input || {}
-            }
-          });
-        }
-      }
-
-      if (parts.length) {
-        out.push({
-          role: "model",
-          parts
-        });
-      }
-    }
-  }
-
-  return out;
-}
-
-function geminiTools(ts) {
-  if (
-    !Array.isArray(ts) ||
-    !ts.length
-  ) {
-    return undefined;
-  }
-
-  return [
-    {
-      functionDeclarations:
-        ts
-          .filter(
-            (t) =>
-              t && t.name
-          )
-          .map((t) => ({
-            name: t.name,
-            description:
-              t.description || "",
-
-            parameters:
-              t.input_schema || {
-                type: "object",
-                properties: {}
-              }
-          }))
-    }
-  ];
-}
-
-function fromGemini(
-  r,
-  requested
-) {
-  const c =
-    r?.candidates?.[0];
-
-  if (!c) {
-    throw Error(
-      "Gemini returned no candidates."
-    );
-  }
-  const parts =
-  c?.content?.parts || [];
-
-if (!parts.length) {
-  throw Error(
-    "Gemini returned an empty response."
-  );
-}
-
-
-  const content = [];
-
-  for (
-    const p of
-      c?.content?.parts || []
-  ) {
-    if (
-      typeof p.text ===
-      "string"
-    ) {
-      content.push({
-        type: "text",
-        text: p.text
-      });
-    }
-
-    else if (
-      p.functionCall
-    ) {
-      content.push({
-        type: "tool_use",
-
-        id:
-          `tool_${crypto.randomUUID()}`,
-
-        name:
-          p.functionCall.name,
-
-        input:
-          p.functionCall.args ||
-          {}
-      });
-    }
-  }
-
-  return {
-    id:
-      `msg_${crypto.randomUUID()}`,
-
-    type: "message",
-    role: "assistant",
-    model: requested,
-    content,
-
-    stop_reason:
-      (
-        c?.content?.parts || []
-      ).some(
-        (p) =>
-          p.functionCall
-      )
-        ? "tool_use"
-        : c.finishReason ===
-          "MAX_TOKENS"
-        ? "max_tokens"
-        : "end_turn",
-
-    stop_sequence: null,
-
-    usage: {
-      input_tokens:
-        r?.usageMetadata
-          ?.promptTokenCount ||
-        0,
-
-      output_tokens:
-        r?.usageMetadata
-          ?.candidatesTokenCount ||
-        0
-    }
   };
 }
 
@@ -1755,8 +1903,9 @@ function shouldFallback(
   text
 ) {
   const x =
-    String(text || "")
-      .toLowerCase();
+    String(
+      text || ""
+    ).toLowerCase();
 
   return (
     status === 429 ||
@@ -1811,440 +1960,132 @@ async function callProvider(
   ms,
   tools
 ) {
-  /*
-   * ==========================================================
-   * CLOUDFLARE AI GATEWAY COMPATIBILITY ENDPOINT
-   *
-   * This path is used when a provider points at:
-   *
-   *   /compat/chat/completions
-   *
-   * It uses the OpenAI-compatible request format.
-   *
-   * Cloudflare Gateway authentication:
-   *
-   *   cf-aig-authorization: Bearer <CF_GATEWAY_TOKEN>
-   *
-   * Provider authentication:
-   *
-   *   Authorization: Bearer <PROVIDER_API_KEY>
-   *
-   * This is intentionally checked BEFORE provider.kind so that
-   * a provider saved as "gemini" can still use the Cloudflare
-   * compatibility endpoint correctly.
-   * ==========================================================
-   */
-
   const baseUrl =
     String(
-      provider.baseUrl || ""
+      provider.baseUrl ||
+      ""
     );
 
+  /*
+   * Cloudflare AI Gateway OpenAI-compatible endpoint.
+   *
+   * This is still OpenAI-compatible, so it remains supported.
+   */
   const isCloudflareCompat =
     baseUrl.includes(
       "/compat/chat/completions"
     );
 
-
-  if (isCloudflareCompat) {
-
-const h = {
-  "Content-Type": "application/json"
-};
-
-
-    /*
-     * Cloudflare AI Gateway authentication.
-     */
-    if (
-      provider.cfAigToken
-    ) {
-      h[
-        "cf-aig-authorization"
-      ] =
-        "Bearer " +
-        provider.cfAigToken;
-    }
-
-
-    /*
-     * Provider authentication.
-     *
-     * For Google AI Studio this is the Google
-     * API key.
-     *
-     * For another OpenAI-compatible provider this
-     * can be its normal bearer credential.
-     */
- 
-
-if (key) {
-  h.Authorization =
-    "Bearer " +
-    key;
-}
-
-    /*
-     * User-defined custom headers.
-     */
-    Object.assign(
-      h,
-      cleanHeaders(
-        provider.extraHeaders
-      )
-    );
-
-
-    const payload = {
-      model,
-      messages:
-        toOpenAIMessages(ms),
-      stream: false
-    };
-
-
-    if (
-      body.max_tokens !==
-      undefined
-    ) {
-      payload.max_tokens =
-        body.max_tokens;
-    }
-
-
-    if (
-      body.temperature !==
-      undefined
-    ) {
-      payload.temperature =
-        body.temperature;
-    }
-
-
-    if (
-      body.top_p !==
-      undefined
-    ) {
-      payload.top_p =
-        body.top_p;
-    }
-
-
-    if (
-      Array.isArray(tools) &&
-      tools.length
-    ) {
-      payload.tools =
-        tools;
-
-      const tc =
-        toolChoice(
-          body.tool_choice
-        );
-
-      if (
-        tc !== undefined
-      ) {
-        payload.tool_choice =
-          tc;
-      }
-    }
-
-
-    return fetch(
-      baseUrl,
-      {
-        method: "POST",
-        headers: h,
-        body:
-          JSON.stringify(
-            payload
-          )
-      }
-    );
-  }
-
+  const h = {
+    "Content-Type":
+      "application/json"
+  };
 
   /*
-   * ==========================================================
-   * GEMINI NATIVE ENDPOINT
-   *
-   * Kept for providers explicitly using the native Gemini
-   * Google AI Studio format rather than /compat/chat/completions.
-   * ==========================================================
+   * Cloudflare AI Gateway authentication.
    */
-
   if (
-    provider.kind ===
-    "gemini"
+    isCloudflareCompat &&
+    provider.cfAigToken
   ) {
-
-    const url =
-      `${baseUrl.replace(
-        /\/$/,
-        ""
-      )}/v1beta/models/${encodeURIComponent(
-        model
-      )}:generateContent`;
-
-
-    const payload = {
-      contents:
-        geminiMessages(ms)
-    };
-
-
-    const sys =
-      systemText(
-        body.system
-      );
-
-    if (sys) {
-      payload.systemInstruction =
-        {
-          parts: [
-            {
-              text: sys
-            }
-          ]
-        };
-    }
-
-
-    const gt =
-      geminiTools(
-        body.tools
-      );
-
-    if (gt) {
-      payload.tools = gt;
-    }
-
-
-    payload.generationConfig =
-      {};
-
-
-    if (
-      body.max_tokens !==
-      undefined
-    ) {
-      payload
-        .generationConfig
-        .maxOutputTokens =
-        body.max_tokens;
-    }
-
-
-    if (
-      body.temperature !==
-      undefined
-    ) {
-      payload
-        .generationConfig
-        .temperature =
-        body.temperature;
-    }
-
-
-    if (
-      body.top_p !==
-      undefined
-    ) {
-      payload
-        .generationConfig
-        .topP =
-        body.top_p;
-    }
-
-
-    const h = {
-      "Content-Type":
-        "application/json"
-    };
-
-
-    if (
-      provider.cfAigToken
-    ) {
-      h[
-        "cf-aig-authorization"
-      ] =
-        "Bearer " +
-        provider.cfAigToken;
-    }
-
-
-    if (key) {
-      h[
-        "x-goog-api-key"
-      ] = key;
-    }
-
-
-    Object.assign(
-      h,
-      cleanHeaders(
-        provider.extraHeaders
-      )
-    );
-
-
-    return fetch(
-      url,
-      {
-        method: "POST",
-        headers: h,
-        body:
-          JSON.stringify(
-            payload
-          )
-      }
-    );
+    h[
+      "cf-aig-authorization"
+    ] =
+      "Bearer " +
+      provider.cfAigToken;
   }
-
 
   /*
-   * ==========================================================
-   * ANTHROPIC-COMPATIBLE PROVIDER
-   * ==========================================================
+   * Normal OpenAI-compatible provider authentication.
    */
+  if (key) {
+    h.Authorization =
+      "Bearer " +
+      key;
+  }
+
+  /*
+   * Optional provider-specific custom headers.
+   */
+  Object.assign(
+    h,
+    cleanHeaders(
+      provider.extraHeaders
+    )
+  );
+
+  const payload = {
+    model,
+
+    messages:
+      toOpenAIMessages(ms),
+
+    stream:
+      false
+  };
 
   if (
-    provider.kind ===
-    "anthropic"
+    body.max_tokens !==
+    undefined
   ) {
+    payload.max_tokens =
+      body.max_tokens;
+  }
 
-    const h = {
-      "Content-Type":
-        "application/json",
+  if (
+    body.temperature !==
+    undefined
+  ) {
+    payload.temperature =
+      body.temperature;
+  }
 
-      "anthropic-version":
-        provider.anthropicVersion ||
-        "2023-06-01"
-    };
+  if (
+    body.top_p !==
+    undefined
+  ) {
+    payload.top_p =
+      body.top_p;
+  }
 
+  if (
+    Array.isArray(tools) &&
+    tools.length
+  ) {
+    payload.tools =
+      tools;
 
-    if (key) {
-      h["x-api-key"] =
-        key;
-    }
-
+    const tc =
+      toolChoice(
+        body.tool_choice
+      );
 
     if (
-      provider.cfAigToken
+      tc !==
+      undefined
     ) {
-      h[
-        "cf-aig-authorization"
-      ] =
-        "Bearer " +
-        provider.cfAigToken;
+      payload.tool_choice =
+        tc;
     }
-
-
-    Object.assign(
-      h,
-      cleanHeaders(
-        provider.extraHeaders
-      )
-    );
-
-
-    const payload = {
-      ...body,
-      model,
-      stream: false
-    };
-
-
-    delete payload.__internal;
-
-
-    return fetch(
-      baseUrl,
-      {
-        method: "POST",
-        headers: h,
-        body:
-          JSON.stringify(
-            payload
-          )
-      }
-    );
   }
 
+  return fetch(
+    baseUrl,
+    {
+      method:
+        "POST",
 
-/*
- * ============================================================
- * NORMAL OPENAI-COMPATIBLE PROVIDER
- * ============================================================
- */
+      headers:
+        h,
 
-const h = {
-  "Content-Type": "application/json"
-};
-
-if (key) {
-  h.Authorization = "Bearer " + key;
+      body:
+        JSON.stringify(
+          payload
+        )
+    }
+  );
 }
 
-/*
- * Optional custom headers configured in the Admin UI.
- *
- * Example:
- * {
- *   "User-Agent": "opencode/1.18.18"
- * }
- *
- * This keeps provider-specific behavior configurable
- * instead of hardcoded into the Worker.
- */
-Object.assign(
-  h,
-  cleanHeaders(provider.extraHeaders)
-);
-
-const payload = {
-  model,
-  messages: toOpenAIMessages(ms),
-  stream: false
-};
-
-if (body.max_tokens !== undefined) {
-  payload.max_tokens = body.max_tokens;
-}
-
-if (body.temperature !== undefined) {
-  payload.temperature = body.temperature;
-}
-
-if (body.top_p !== undefined) {
-  payload.top_p = body.top_p;
-}
-
-if (
-  Array.isArray(tools) &&
-  tools.length
-) {
-  payload.tools = tools;
-
-  const tc = toolChoice(body.tool_choice);
-
-  if (tc !== undefined) {
-    payload.tool_choice = tc;
-  }
-}
-
-return fetch(
-  baseUrl,
-  {
-    method: "POST",
-    headers: h,
-    body: JSON.stringify(payload)
-  }
-);
-
-}
 async function callWithKeys(
   provider,
   model,
@@ -2253,7 +2094,9 @@ async function callWithKeys(
   tools
 ) {
   const keys =
-    Array.isArray(provider.apiKeys) &&
+    Array.isArray(
+      provider.apiKeys
+    ) &&
     provider.apiKeys.length
       ? provider.apiKeys
       : [null];
@@ -2261,46 +2104,67 @@ async function callWithKeys(
   const attempts = [];
   let last = null;
 
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
+  for (
+    let i = 0;
+    i < keys.length;
+    i++
+  ) {
+    const key =
+      keys[i];
 
     try {
-      const r = await callProvider(
-        provider,
-        model,
-        key,
-        body,
-        ms,
-        tools
-      );
+      const r =
+        await callProvider(
+          provider,
+          model,
+          key,
+          body,
+          ms,
+          tools
+        );
 
-      const text = await r.text();
+      const text =
+        await r.text();
+
       const retryAfter =
-        r.headers.get("retry-after") ||
-        null;
+        r.headers.get(
+          "retry-after"
+        ) || null;
 
       last = {
-        ok: r.ok,
-        status: r.status,
+        ok:
+          r.ok,
+
+        status:
+          r.status,
+
         text,
+
         contentType:
-          r.headers.get("content-type"),
-        keyIndex: i,
+          r.headers.get(
+            "content-type"
+          ),
+
+        keyIndex:
+          i,
+
         retryAfter
       };
 
       attempts.push({
-        keyIndex: i,
-        status: r.status,
-        ok: r.ok
+        keyIndex:
+          i,
+
+        status:
+          r.status,
+
+        ok:
+          r.ok
       });
 
       /*
-       * Successful HTTP response.
-       *
-       * IMPORTANT:
-       * We return it to the pool router, which is responsible
-       * for validating/parsing the actual provider payload.
+       * A successful HTTP response is returned to the pool
+       * router for JSON validation/parsing.
        */
       if (r.ok) {
         return {
@@ -2310,9 +2174,7 @@ async function callWithKeys(
       }
 
       /*
-       * HTTP failure.
-       *
-       * If this error is considered retryable, try the next key.
+       * Retry the next key for retryable failures.
        */
       if (
         shouldFallback(
@@ -2324,91 +2186,75 @@ async function callWithKeys(
       }
 
       /*
-       * Non-retryable failure:
-       * stop rotating keys for this provider.
+       * Non-retryable provider error.
        */
       return {
         ...last,
         attempts
       };
 
-    } catch (err) {
+    } catch (
+      err
+    ) {
       last = {
-        ok: false,
-        status: 502,
+        ok:
+          false,
+
+        status:
+          502,
+
         text:
           err?.message ||
           "Provider request failed.",
+
         contentType:
           "application/json",
-        keyIndex: i,
-        retryAfter: null
+
+        keyIndex:
+          i,
+
+        retryAfter:
+          null
       };
 
       attempts.push({
-        keyIndex: i,
-        status: 502,
-        ok: false,
+        keyIndex:
+          i,
+
+        status:
+          502,
+
+        ok:
+          false,
+
         error:
           err?.message ||
           "Provider request failed."
       });
 
-      /*
-       * Network/fetch exception:
-       * try the next key.
-       */
       continue;
     }
   }
 
   return {
     ...(last || {
-      ok: false,
-      status: 502,
-      text: "All provider keys failed.",
+      ok:
+        false,
+
+      status:
+        502,
+
+      text:
+        "All provider keys failed.",
+
       contentType:
         "application/json",
-      retryAfter: null
+
+      retryAfter:
+        null
     }),
+
     attempts
-  };
-}
-function fromAnthropic(
-  r,
-  requested
-) {
-  return {
-    id:
-      r.id ||
-      `msg_${crypto.randomUUID()}`,
-
-    type: "message",
-    role: "assistant",
-    model: requested,
-
-    content:
-      r.content || [],
-
-    stop_reason:
-      r.stop_reason ||
-      "end_turn",
-
-    stop_sequence:
-      r.stop_sequence ??
-      null,
-
-    usage: {
-      input_tokens:
-        r?.usage
-          ?.input_tokens ||
-        0,
-
-      output_tokens:
-        r?.usage
-          ?.output_tokens ||
-        0
-    }
   };
 }
 
@@ -2426,11 +2272,20 @@ function sse(msg) {
         "message_start",
 
       message: {
-        id: msg.id,
-        type: "message",
-        role: "assistant",
-        model: msg.model,
-        content: [],
+        id:
+          msg.id,
+
+        type:
+          "message",
+
+        role:
+          "assistant",
+
+        model:
+          msg.model,
+
+        content:
+          [],
 
         stop_reason:
           null,
@@ -2443,7 +2298,8 @@ function sse(msg) {
             msg.usage
               .input_tokens,
 
-          output_tokens: 0
+          output_tokens:
+            0
         }
       }
     }
@@ -2452,7 +2308,8 @@ function sse(msg) {
   msg.content.forEach(
     (b, i) => {
       if (
-        b.type === "text"
+        b.type ===
+        "text"
       ) {
         ev.push([
           "content_block_start",
@@ -2460,11 +2317,15 @@ function sse(msg) {
             type:
               "content_block_start",
 
-            index: i,
+            index:
+              i,
 
             content_block: {
-              type: "text",
-              text: ""
+              type:
+                "text",
+
+              text:
+                ""
             }
           }
         ]);
@@ -2475,14 +2336,16 @@ function sse(msg) {
             type:
               "content_block_delta",
 
-            index: i,
+            index:
+              i,
 
             delta: {
               type:
                 "text_delta",
 
               text:
-                b.text || ""
+                b.text ||
+                ""
             }
           }
         ]);
@@ -2493,7 +2356,8 @@ function sse(msg) {
             type:
               "content_block_stop",
 
-            index: i
+            index:
+              i
           }
         ]);
       }
@@ -2508,15 +2372,21 @@ function sse(msg) {
             type:
               "content_block_start",
 
-            index: i,
+            index:
+              i,
 
             content_block: {
               type:
                 "tool_use",
 
-              id: b.id,
-              name: b.name,
-              input: {}
+              id:
+                b.id,
+
+              name:
+                b.name,
+
+              input:
+                {}
             }
           }
         ]);
@@ -2527,7 +2397,8 @@ function sse(msg) {
             type:
               "content_block_delta",
 
-            index: i,
+            index:
+              i,
 
             delta: {
               type:
@@ -2535,7 +2406,8 @@ function sse(msg) {
 
               partial_json:
                 JSON.stringify(
-                  b.input || {}
+                  b.input ||
+                  {}
                 )
             }
           }
@@ -2547,7 +2419,8 @@ function sse(msg) {
             type:
               "content_block_stop",
 
-            index: i
+            index:
+              i
           }
         ]);
       }
@@ -2594,82 +2467,108 @@ function sse(msg) {
     .join("");
 }
 
+/* ============================================================
+   POOL RESOLUTION
+   ============================================================ */
 
-
-  function resolvePoolId(requested, rm, poolsConfig) {
+function resolvePoolId(
+  requested,
+  rm,
+  poolsConfig
+) {
   const name =
-    String(requested || "").toLowerCase();
+    String(
+      requested || ""
+    ).toLowerCase();
 
-  const rules = Array.isArray(rm?.rules)
-    ? rm.rules
-    : [];
-
-  const matches = rules
-    .filter(
-      (r) =>
-        r &&
-        r.keyword &&
-        r.poolId &&
-        name.includes(
-          String(r.keyword).toLowerCase()
-        )
+  const rules =
+    Array.isArray(
+      rm?.rules
     )
-    .sort(
-      (a, b) =>
-        String(b.keyword).length -
-        String(a.keyword).length
-    );
+      ? rm.rules
+      : [];
 
-  for (const r of matches) {
-    if (poolsConfig?.[r.poolId]) {
+  const matches =
+    rules
+      .filter(
+        (r) =>
+          r &&
+          r.keyword &&
+          r.poolId &&
+          name.includes(
+            String(
+              r.keyword
+            ).toLowerCase()
+          )
+      )
+      .sort(
+        (a, b) =>
+          String(
+            b.keyword
+          ).length -
+          String(
+            a.keyword
+          ).length
+      );
+
+  for (
+    const r of
+      matches
+  ) {
+    if (
+      poolsConfig?.[
+        r.poolId
+      ]
+    ) {
       return r.poolId;
     }
   }
 
   if (
     rm?.defaultPoolId &&
-    poolsConfig?.[rm.defaultPoolId]
+    poolsConfig?.[
+      rm.defaultPoolId
+    ]
   ) {
     return rm.defaultPoolId;
   }
 
   return (
-    Object.keys(poolsConfig || {})[0] ||
+    Object.keys(
+      poolsConfig || {}
+    )[0] ||
     ""
   );
 }
 
 /* ============================================================
    MAIN ROUTER
-
-   Tries every entry in the resolved pool, in order. If EVERY
-   entry in that pool fails with a retryable error (rate limit,
-   bad key, dead model, etc.), and that pool has a
-   fallbackPoolId configured, the router moves on to that pool
-   and tries its entries too — and so on, until something
-   succeeds, a pool has no further fallback, or a pool we've
-   already visited would be revisited (cycle guard).
-
-   This is what actually fixes "a whole tier is exhausted":
-   rotating providers/models WITHIN one pool can't help when
-   they all share one quota (e.g. one free-tier account), but
-   moving to a different pool backed by different credentials
-   can.
    ============================================================ */
 
-async function router(request, env) {
-  const ra = await routerAuth(env);
+async function router(
+  request,
+  env
+) {
+  const ra =
+    await routerAuth(env);
 
   /*
    * Optional protection for /v1/messages.
    */
   if (ra.enabled) {
     const authHeader =
-      request.headers.get("authorization") || "";
+      request.headers.get(
+        "authorization"
+      ) || "";
 
     if (
-      !/^Bearer\s+\S+$/i.test(authHeader) ||
-      authHeader.slice(7).trim() !== ra.token
+      !/^Bearer\s+\S+$/i.test(
+        authHeader
+      ) ||
+      authHeader
+        .slice(7)
+        .trim() !==
+        ra.token
     ) {
       return aerr(
         "Unauthorized.",
@@ -2682,16 +2581,19 @@ async function router(request, env) {
   let body;
 
   try {
-    body = await request.json();
+    body =
+      await request.json();
   } catch {
     return aerr(
       "Invalid JSON request body."
     );
   }
 
-  const requested = String(
-    body.model || "default"
-  );
+  const requested =
+    String(
+      body.model ||
+      "default"
+    );
 
   const [
     ps,
@@ -2703,11 +2605,12 @@ async function router(request, env) {
     rolemap(env)
   ]);
 
-  const startPoolId = resolvePoolId(
-    requested,
-    rm,
-    pls
-  );
+  const startPoolId =
+    resolvePoolId(
+      requested,
+      rm,
+      pls
+    );
 
   if (!startPoolId) {
     return aerr(
@@ -2715,34 +2618,48 @@ async function router(request, env) {
     );
   }
 
-  const ms = body.messages || [];
+  const ms =
+    body.messages || [];
 
-  const tools = toOpenAITools(
-    body.tools
-  );
+  const tools =
+    toOpenAITools(
+      body.tools
+    );
 
   let lastStatus = 503;
   let lastRetryAfter = null;
 
   const attempts = [];
-  const visitedPools = new Set();
-  let currentPoolId = startPoolId;
+  const visitedPools =
+    new Set();
+
+  let currentPoolId =
+    startPoolId;
 
   while (
     currentPoolId &&
-    !visitedPools.has(currentPoolId)
+    !visitedPools.has(
+      currentPoolId
+    )
   ) {
-    visitedPools.add(currentPoolId);
+    visitedPools.add(
+      currentPoolId
+    );
 
-    const pool = pls[currentPoolId];
+    const pool =
+      pls[currentPoolId];
 
     if (
       !pool ||
-      !Array.isArray(pool.entries) ||
+      !Array.isArray(
+        pool.entries
+      ) ||
       !pool.entries.length
     ) {
       currentPoolId =
-        pool?.fallbackPoolId || null;
+        pool?.fallbackPoolId ||
+        null;
+
       continue;
     }
 
@@ -2751,53 +2668,84 @@ async function router(request, env) {
      */
     for (
       let index = 0;
-      index < pool.entries.length;
+      index <
+        pool.entries.length;
       index++
     ) {
-      const e = pool.entries[index];
+      const e =
+        pool.entries[index];
 
-      const providerId = String(
-        e?.providerId || ""
-      );
+      const providerId =
+        String(
+          e?.providerId ||
+          ""
+        );
 
-      const backendModel = String(
-        e?.model || ""
-      );
+      const backendModel =
+        String(
+          e?.model ||
+          ""
+        );
 
       /*
        * Invalid pool entry.
        */
-      if (!providerId || !backendModel) {
+      if (
+        !providerId ||
+        !backendModel
+      ) {
         attempts.push({
-          pool: currentPoolId,
+          pool:
+            currentPoolId,
+
           index,
+
           providerId,
-          model: backendModel,
-          status: 400,
-          error: "Invalid pool entry."
+
+          model:
+            backendModel,
+
+          status:
+            400,
+
+          error:
+            "Invalid pool entry."
         });
 
-        lastStatus = 400;
+        lastStatus =
+          400;
+
         continue;
       }
 
       /*
        * Provider does not exist.
        */
-      const p = ps[providerId];
+      const p =
+        ps[providerId];
 
       if (!p) {
         attempts.push({
-          pool: currentPoolId,
+          pool:
+            currentPoolId,
+
           index,
+
           providerId,
-          model: backendModel,
-          status: 502,
+
+          model:
+            backendModel,
+
+          status:
+            502,
+
           error:
             `Provider "${providerId}" is not configured.`
         });
 
-        lastStatus = 502;
+        lastStatus =
+          502;
+
         continue;
       }
 
@@ -2807,61 +2755,92 @@ async function router(request, env) {
        * Call provider.
        */
       try {
-        r = await callWithKeys(
-          p,
-          backendModel,
-          body,
-          ms,
-          tools
-        );
-      } catch (err) {
+        r =
+          await callWithKeys(
+            p,
+            backendModel,
+            body,
+            ms,
+            tools
+          );
+      } catch (
+        err
+      ) {
         const msg =
           err?.message ||
           "Provider request failed.";
 
         attempts.push({
-          pool: currentPoolId,
+          pool:
+            currentPoolId,
+
           index,
+
           providerId,
-          model: backendModel,
-          status: 502,
-          error: msg
+
+          model:
+            backendModel,
+
+          status:
+            502,
+
+          error:
+            msg
         });
 
-        lastStatus = 502;
+        lastStatus =
+          502;
+
         continue;
       }
 
-      if (r?.retryAfter) {
-        lastRetryAfter = r.retryAfter;
+      if (
+        r?.retryAfter
+      ) {
+        lastRetryAfter =
+          r.retryAfter;
       }
 
       /*
        * Record attempt.
        */
       attempts.push({
-        pool: currentPoolId,
+        pool:
+          currentPoolId,
+
         index,
+
         providerId,
-        model: backendModel,
-        status: r?.status || 502,
-        ok: !!r?.ok,
+
+        model:
+          backendModel,
+
+        status:
+          r?.status ||
+          502,
+
+        ok:
+          !!r?.ok,
+
         error:
           !r?.ok
             ? String(
-                r?.text || ""
-              ).slice(0, 500)
+                r?.text ||
+                ""
+              ).slice(
+                0,
+                500
+              )
             : undefined
       });
 
       /*
        * HTTP failure.
-       *
-       * Retry the NEXT pool entry when retryable.
        */
       if (!r?.ok) {
         lastStatus =
-          r?.status || 502;
+          r?.status ||
+          502;
 
         if (
           shouldFallback(
@@ -2876,7 +2855,9 @@ async function router(request, env) {
           r.text,
           {
             status:
-              r.status || 502,
+              r.status ||
+              502,
+
             headers: {
               "content-type":
                 r.contentType ||
@@ -2898,23 +2879,33 @@ async function router(request, env) {
       /*
        * HTTP success.
        *
-       * Still validate the provider payload.
+       * Validate that the provider returned JSON.
        */
       let parsed;
 
       try {
-        parsed = JSON.parse(
-          r.text
-        );
+        parsed =
+          JSON.parse(
+            r.text
+          );
       } catch {
-        lastStatus = 502;
+        lastStatus =
+          502;
 
         attempts.push({
-          pool: currentPoolId,
+          pool:
+            currentPoolId,
+
           index,
+
           providerId,
-          model: backendModel,
-          status: 502,
+
+          model:
+            backendModel,
+
+          status:
+            502,
+
           error:
             `${providerId}/${backendModel} returned invalid JSON.`
         });
@@ -2923,43 +2914,38 @@ async function router(request, env) {
       }
 
       /*
-       * Convert provider response
-       * into Anthropic-compatible format.
+       * Convert the OpenAI-compatible response
+       * into Claude/Anthropic-compatible format.
        */
       let msg;
 
       try {
-        if (p.kind === "gemini") {
-          msg = fromGemini(
-            parsed,
-            requested
-          );
-        }
-        else if (
-          p.kind === "anthropic"
-        ) {
-          msg = fromAnthropic(
-            parsed,
-            requested
-          );
-        }
-        else {
-          msg = fromOpenAI(
+        msg =
+          fromOpenAI(
             parsed,
             requested,
             backendModel
           );
-        }
-
-      } catch (err) {
-        lastStatus = 502;
+      } catch (
+        err
+      ) {
+        lastStatus =
+          502;
 
         attempts.push({
-          pool: currentPoolId,
+          pool:
+            currentPoolId,
+
           index,
+
           providerId,
-          model: backendModel,
-          status: 502,
+
+          model:
+            backendModel,
+
+          status:
+            502,
+
           error:
             `${providerId}/${backendModel}: ${
               err?.message ||
@@ -2968,9 +2954,7 @@ async function router(request, env) {
         });
 
         /*
-         * IMPORTANT:
-         *
-         * A malformed 200 response also causes
+         * Malformed 200 response also causes
          * failover to the next pool entry.
          */
         continue;
@@ -2990,25 +2974,32 @@ async function router(request, env) {
           currentPoolId,
 
         "X-Router-Attempt":
-          String(attempts.length),
+          String(
+            attempts.length
+          ),
 
         "X-Router-Attempts":
-          String(attempts.length)
+          String(
+            attempts.length
+          )
       };
 
       /*
        * Convert to SSE when Claude requested streaming.
        *
-       * Note: the upstream request is still sent non-streaming;
-       * sse() converts the completed response into Anthropic SSE.
+       * The upstream request is still sent non-streaming.
+       * sse() converts the completed response to Anthropic SSE.
        */
       if (
-        body.stream === true
+        body.stream ===
+        true
       ) {
         return new Response(
           sse(msg),
           {
-            status: 200,
+            status:
+              200,
+
             headers: {
               "content-type":
                 "text/event-stream",
@@ -3030,57 +3021,73 @@ async function router(request, env) {
     }
 
     /*
-     * Every entry in this pool failed (retryably). Move on to
-     * this pool's configured fallback pool, if any. The
-     * visitedPools guard above prevents cycles.
+     * Every entry in this pool failed.
+     * Move to its fallback pool.
      */
     currentPoolId =
-      pool.fallbackPoolId || null;
+      pool.fallbackPoolId ||
+      null;
   }
 
   /*
-   * Nothing worked, anywhere in the fallback chain.
+   * Nothing worked anywhere in the fallback chain.
    */
   const summary =
     attempts
-      .map((a) => {
-        const poolTag =
-          a.pool
-            ? `[${a.pool}] `
-            : "";
+      .map(
+        (a) => {
+          const poolTag =
+            a.pool
+              ? `[${a.pool}] `
+              : "";
 
-        const provider =
-          a.providerId || "?";
+          const provider =
+            a.providerId ||
+            "?";
 
-        const model =
-          a.model || "?";
+          const model =
+            a.model ||
+            "?";
 
-        const status =
-          a.status || "?";
+          const status =
+            a.status ||
+            "?";
 
-        const error =
-          a.error
-            ? String(
-                a.error
-              ).slice(0, 300)
-            : "";
+          const error =
+            a.error
+              ? String(
+                  a.error
+                ).slice(
+                  0,
+                  300
+                )
+              : "";
 
-        return (
-          `${poolTag}${provider}/${model} → ${status}` +
-          (
-            error
-              ? ` → ${error}`
-              : ""
-          )
-        );
-      })
-      .join(" | ");
+          return (
+            `${poolTag}${provider}/${model} → ${status}` +
+            (
+              error
+                ? ` → ${error}`
+                : ""
+            )
+          );
+        }
+      )
+      .join(
+        " | "
+      );
 
   const finalHeaders = {};
 
-  if (lastStatus === 429) {
-    finalHeaders["Retry-After"] =
-      lastRetryAfter || "30";
+  if (
+    lastStatus ===
+    429
+  ) {
+    finalHeaders[
+      "Retry-After"
+    ] =
+      lastRetryAfter ||
+      "30";
   }
 
   return aerr(
@@ -3091,6 +3098,7 @@ async function router(request, env) {
     finalHeaders
   );
 }
+
 /* ============================================================
    ADMIN PANEL
    ============================================================ */
@@ -3162,7 +3170,6 @@ const ADMIN_HTML = [
   ".title input{font-weight:650;font-size:14.5px;background:transparent;border:1px solid transparent;padding:2px 4px;margin-left:-4px;border-radius:6px}",
   ".title input:hover{border-color:var(--border2)}",
   ".id{color:var(--muted2);font:11.5px ui-monospace,monospace;margin-top:4px;display:flex;align-items:center;gap:6px}",
-  ".pill{font-size:10.5px;text-transform:uppercase;letter-spacing:.03em;border:1px solid var(--border2);background:var(--panel3);border-radius:999px;padding:2px 8px;color:var(--muted)}",
   ".section-note{margin:8px 0 20px;max-width:640px}",
   ".codebox{background:#0d1016;border:1px solid var(--border2);border-radius:var(--radius-sm);padding:11px 13px;font:12px ui-monospace,monospace;overflow-wrap:anywhere;color:#a9e6c4}",
   ".empty{color:var(--muted2);font-size:13px;border:1px dashed var(--border2);border-radius:var(--radius-sm);padding:22px;text-align:center;margin-bottom:14px}",
@@ -3175,6 +3182,7 @@ const ADMIN_HTML = [
   "</style>",
   "</head>",
   "<body>",
+
   "<div id=\"login\" class=\"center\"><div class=\"card login\">",
   "<div class=\"brand\"><span class=\"dot\"></span><h2>JBRouter</h2></div>",
   "<div class=\"muted\">Admin login</div>",
@@ -3198,6 +3206,7 @@ const ADMIN_HTML = [
   "</div></div>",
 
   "<div id=\"app\" class=\"hide\">",
+
   "<div class=\"top\">",
   "<b><span class=\"dot\" style=\"width:7px;height:7px;border-radius:50%;background:var(--success);display:inline-block\"></span> JBRouter</b>",
   "<button class=\"secondary\" id=\"logout\">Log out</button>",
@@ -3227,14 +3236,14 @@ const ADMIN_HTML = [
 
   "<section id=\"pools\" class=\"sec\">",
   "<h2>Pools</h2>",
-  "<div class=\"muted section-note\">Each pool is an ordered fallback list of provider + model entries. If every entry in a pool fails, its optional \\\"fall back to pool\\\" setting lets the router continue into an entirely different pool — useful when a pool's entries share one quota (e.g. several free models on the same account) and rotating within it can't help.</div>",
+  "<div class=\"muted section-note\">Each pool is an ordered fallback list of provider + model entries. If every entry in a pool fails, its optional \"fall back to pool\" setting lets the router continue into another pool.</div>",
   "<div id=\"poolList\"></div>",
   "<button class=\"secondary\" id=\"addPool\">+ Add pool</button>",
   "</section>",
 
   "<section id=\"providers\" class=\"sec\">",
   "<h2>Providers</h2>",
-  "<div class=\"muted section-note\">OpenAI-compatible, Gemini (native or via Cloudflare AI Gateway), or another Anthropic-compatible API.</div>",
+  "<div class=\"muted section-note\"><strong>It must be OpenAI-compatible.</strong> The provider must accept OpenAI-style chat completions at the configured Base URL.</div>",
   "<div id=\"providerList\"></div>",
   "<button class=\"secondary\" id=\"addProvider\">+ Add provider</button>",
   "</section>",
@@ -3459,7 +3468,7 @@ const ADMIN_HTML = [
   "  var fbNote = document.createElement(\"div\");",
   "  fbNote.className = \"muted\";",
   "  fbNote.style.marginTop = \"6px\";",
-  "  fbNote.textContent = \"Use this when a pool's entries share one rate limit (e.g. several free models on the same account) so rotation alone can't help.\";",
+  "  fbNote.textContent = \"Use this when a pool's entries share one rate limit so rotation alone can't help.\";",
   "  fbWrap.appendChild(fbLabel);",
   "  fbWrap.appendChild(fbSelect);",
   "  fbWrap.appendChild(fbNote);",
@@ -3547,14 +3556,9 @@ const ADMIN_HTML = [
   "  var maskedKeys = p.apiKeysMasked && p.apiKeysMasked.length ? \"— \" + p.apiKeysMasked.join(\", \") : \"\";",
 
   "  d.innerHTML =",
-  "    \"<div class=\\\"title\\\"><div><input data-label value=\\\"\" + esc(p.label) + \"\\\"><div class=\\\"id\\\">\" + esc(p.id) + \" <span class=\\\"pill\\\">\" + esc(p.kind) + \"</span></div></div><button data-del class=\\\"danger\\\">Delete provider</button></div>\" +",
-  "    \"<div class=\\\"grid\\\"><div><label>Kind</label><select data-kind>\" +",
-  "      \"<option value=\\\"openai\\\"\" + (p.kind === \"openai\" ? \" selected\" : \"\") + \">OpenAI-compatible</option>\" +",
-  "      \"<option value=\\\"gemini\\\"\" + (p.kind === \"gemini\" ? \" selected\" : \"\") + \">Gemini</option>\" +",
-  "      \"<option value=\\\"anthropic\\\"\" + (p.kind === \"anthropic\" ? \" selected\" : \"\") + \">Anthropic-compatible</option>\" +",
-  "    \"</select></div><div><label>Base URL</label><input data-url value=\\\"\" + esc(p.baseUrl) + \"\\\" placeholder=\\\"https://...\\\"></div></div>\" +",
-  "    \"<div class=\\\"grid\\\"><div><label>CF AI Gateway token \" + cfStatus + \"</label><input data-cf type=\\\"text\\\" placeholder=\\\"blank = keep existing\\\"></div>\" +",
-  "    \"<div><label>Anthropic version</label><input data-av value=\\\"\" + esc(p.anthropicVersion || \"\") + \"\\\" placeholder=\\\"2023-06-01\\\"></div></div>\" +",
+  "    \"<div class=\\\"title\\\"><div><input data-label value=\\\"\" + esc(p.label) + \"\\\"><div class=\\\"id\\\">\" + esc(p.id) + \"</div></div><button data-del class=\\\"danger\\\">Delete provider</button></div>\" +",
+  "    \"<div><label>Base URL</label><input data-url value=\\\"\" + esc(p.baseUrl) + \"\\\" placeholder=\\\"https://...\\\"></div>\" +",
+  "    \"<div><label>CF AI Gateway token \" + cfStatus + \"</label><input data-cf type=\\\"text\\\" placeholder=\\\"blank = keep existing\\\"></div>\" +",
   "    \"<label>Extra headers (JSON object)</label><textarea data-h placeholder='{\\\"X-Custom-Header\\\":\\\"value\\\"}'></textarea>\" +",
   "    \"<div class=\\\"muted\\\">Custom upstream headers. Values are stored in KV.</div>\" +",
   "    \"<label>API keys (\" + String(p.apiKeyCount || 0) + \") \" + maskedKeys + \"</label>\" +",
@@ -3564,7 +3568,6 @@ const ADMIN_HTML = [
 
   "  d.querySelector(\"[data-h]\").value = JSON.stringify(p.extraHeaders || {},null,2);",
   "  d.querySelector(\"[data-label]\").oninput = function(e){p.label=e.target.value;};",
-  "  d.querySelector(\"[data-kind]\").onchange = function(e){p.kind=e.target.value;};",
   "  d.querySelector(\"[data-url]\").oninput = function(e){p.baseUrl=e.target.value;};",
 
   "  d.querySelector(\"[data-save]\").onclick = async function(){",
@@ -3593,10 +3596,8 @@ const ADMIN_HTML = [
   "      body:JSON.stringify({",
   "        id:p.id,",
   "        label:p.label,",
-  "        kind:p.kind,",
   "        baseUrl:p.baseUrl,",
   "        cfAigToken:d.querySelector(\"[data-cf]\").value,",
-  "        anthropicVersion:d.querySelector(\"[data-av]\").value,",
   "        extraHeaders:headers,",
   "        apiKeysRaw:d.querySelector(\"[data-k]\").value",
   "      })",
@@ -3617,7 +3618,15 @@ const ADMIN_HTML = [
 
   "document.getElementById(\"addProvider\").onclick = function(){",
   "  var id = \"provider-\" + Math.random().toString(36).slice(2,8);",
-  "  S.providers[id] = {id:id,label:\"New Provider\",kind:\"openai\",baseUrl:\"\",hasCfAigToken:false,anthropicVersion:\"\",extraHeaders:{},apiKeyCount:0,apiKeysMasked:[]};",
+  "  S.providers[id] = {",
+  "    id:id,",
+  "    label:\"New Provider\",",
+  "    baseUrl:\"\",",
+  "    hasCfAigToken:false,",
+  "    extraHeaders:{},",
+  "    apiKeyCount:0,",
+  "    apiKeysMasked:[]",
+  "  };",
   "  renderProviders();",
   "  renderPools();",
   "};",
@@ -3727,25 +3736,35 @@ const ADMIN_HTML = [
 export default {
   async fetch(request, env) {
     try {
-      const url = new URL(request.url);
+      const url =
+        new URL(request.url);
 
       /* HEALTH */
       if (
-        request.method === "GET" &&
-        url.pathname === "/health"
+        request.method ===
+          "GET" &&
+        url.pathname ===
+          "/health"
       ) {
-        return new Response("OK", {
-          status: 200,
-          headers: {
-            "content-type":
-              "text/plain; charset=utf-8"
+        return new Response(
+          "OK",
+          {
+            status:
+              200,
+
+            headers: {
+              "content-type":
+                "text/plain; charset=utf-8"
+            }
           }
-        });
+        );
       }
 
       /* ADMIN */
       if (
-        url.pathname.startsWith("/admin")
+        url.pathname.startsWith(
+          "/admin"
+        )
       ) {
         return await admin(
           request,
@@ -3756,13 +3775,17 @@ export default {
 
       /* ROUTER */
       if (
-        request.method !== "POST" ||
-        url.pathname !== "/v1/messages"
+        request.method !==
+          "POST" ||
+        url.pathname !==
+          "/v1/messages"
       ) {
         return new Response(
           "Not Found",
           {
-            status: 404,
+            status:
+              404,
+
             headers: {
               "content-type":
                 "text/plain; charset=utf-8"
@@ -3776,7 +3799,9 @@ export default {
         env
       );
 
-    } catch (e) {
+    } catch (
+      e
+    ) {
       return aerr(
         e?.message ||
           "Internal Worker error.",
@@ -3786,3 +3811,4 @@ export default {
     }
   }
 };
+```
