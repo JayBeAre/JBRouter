@@ -31,15 +31,6 @@ const K = {
 };
 
 const DEFAULT_PROVIDERS = {
-  "avalai-deepseek": {
-    id: "avalai-deepseek",
-    label: "AvalAI — DeepSeek V4 Flash",
-    baseUrl: "https://api.avalai.ir/v1/chat/completions",
-    cfAigToken: "",
-    extraHeaders: {},
-    apiKeys: []
-  },
-
   "opencode-zen": {
     id: "opencode-zen",
     label: "OpenCode Zen (free)",
@@ -56,8 +47,7 @@ const DEFAULT_POOLS = {
     label: "Opus Pool",
     entries: [
       {
-        providerId: "avalai-deepseek",
-        model: "deepseek-v4-flash"
+         
       }
     ],
     fallbackPoolId: ""
