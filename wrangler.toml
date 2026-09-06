@@ -1,0 +1,15 @@
+name = "jbrouter"
+main = "src/index.ts"
+compatibility_date = "2026-09-06"
+
+# This serves the contents of the 'public' directory
+[assets]
+directory = "public"
+
+[vars]
+# Add your environment variables here, e.g.:
+# KV_NAMESPACE_ID = "..."
+
+[[kv_namespaces]]
+binding = "CONFIG_KV"
+id = "49f33a74442b4d5db5899460df175d72"

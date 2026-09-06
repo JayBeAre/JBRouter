@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JBRouter Admin</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div id="login" class="center"><div class="card login">
+    <div class="brand"><span class="dot"></span><h2>JBRouter</h2></div>
+    <div class="muted">Admin login</div>
+    <label>Password</label>
+    <input id="lp" type="password" autocomplete="current-password">
+    <button class="primary" id="lb" style="width:100%;margin-top:16px">Log in</button>
+    <div id="le" class="err"></div>
+  </div></div>
+
+  <div id="force" class="center hide"><div class="card login">
+    <div class="brand"><span class="dot" style="background:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)"></span><h2>Set a new password</h2></div>
+    <div class="muted">The default password must be changed before continuing.</div>
+    <label>Current password</label>
+    <input id="fc" type="password" autocomplete="current-password">
+    <label>New password</label>
+    <input id="fn" type="password" autocomplete="new-password">
+    <label>Confirm new password</label>
+    <input id="fx" type="password" autocomplete="new-password">
+    <button class="primary" id="fb" style="width:100%;margin-top:16px">Set password</button>
+    <div id="fe" class="err"></div>
+  </div></div>
+
+  <div id="app" class="hide">
+
+    <div class="top">
+      <b><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--success);display:inline-block"></span> JBRouter</b>
+      <button class="secondary" id="logout">Log out</button>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-s="roles">Role Mapping</div>
+      <div class="tab" data-s="pools">Pools</div>
+      <div class="tab" data-s="providers">Providers</div>
+      <div class="tab" data-s="security">Security</div>
+    </div>
+
+    <div class="wide">
+
+      <section id="roles" class="sec active">
+        <h2>Role Mapping</h2>
+        <div class="muted section-note">The most specific matching keyword selects the pool for an incoming model name; otherwise the default pool is used.</div>
+        <div id="rules"></div>
+        <button class="secondary" id="addRule">+ Add rule</button>
+        <label>Default pool</label>
+        <select id="defaultPool"></select>
+        <div class="actions">
+          <button class="primary" id="saveRoles">Save role mapping</button>
+        </div>
+        <div id="rmmsg" class="ok"></div>
+      </section>
+
+      <section id="pools" class="sec">
+        <h2>Pools</h2>
+        <div class="muted section-note">Each pool is an ordered fallback list of provider + model entries. If every entry in a pool fails, its optional "fall back to pool" setting lets the router continue into another pool.</div>
+        <div id="poolList"></div>
+        <button class="secondary" id="addPool">+ Add pool</button>
+      </section>
+
+      <section id="providers" class="sec">
+        <h2>Providers</h2>
+        <div class="muted section-note"><strong>It must be OpenAI-compatible.</strong> The provider must accept OpenAI-style chat completions at the configured Base URL.</div>
+        <div id="providerList"></div>
+        <button class="secondary" id="addProvider">+ Add provider</button>
+      </section>
+
+      <section id="security" class="sec">
+        <h2>Security</h2>
+        <div class="grid">
+
+          <div class="card">
+            <h3>Admin password</h3>
+            <label>Current password</label>
+            <input id="sc" type="password" autocomplete="current-password">
+            <label>New password</label>
+            <input id="sn" type="password" autocomplete="new-password">
+            <label>Confirm</label>
+            <input id="sx" type="password" autocomplete="new-password">
+            <button class="primary" id="sb" style="margin-top:16px">Update password</button>
+            <div id="se" class="err"></div>
+            <div id="sok" class="ok"></div>
+          </div>
+
+          <div class="card">
+            <h3>Router API authentication</h3>
+            <div class="muted">When enabled, /v1/messages requires:</div>
+            <div class="codebox" style="margin-top:10px">Authorization: Bearer YOUR_TOKEN</div>
+            <label class="check">
+              <input id="raEnabled" type="checkbox"> Enabled
+            </label>
+            <label>Bearer token</label>
+            <textarea id="raToken" placeholder="Generate or paste a token"></textarea>
+            <div class="actions">
+              <button class="secondary" id="genToken">Generate token</button>
+              <button class="primary" id="saveRA">Save</button>
+            </div>
+            <div id="raStatus" class="muted"></div>
+            <div id="rae" class="err"></div>
+            <div id="ras" class="ok"></div>
+          </div>
+
+          <div class="card">
+            <h3>Debug mode</h3>
+            <div class="muted">Enables the diagnostic endpoints <span class="codebox">/debug</span> and <span class="codebox">/debug/zen</span>.</div>
+            <label class="check">
+              <input id="debugEnabled" type="checkbox"> Enabled
+            </label>
+            <div id="debugStatus" class="muted" style="margin-top:10px"></div>
+            <div class="actions">
+              <button class="primary" id="saveDebug">Save</button>
+              <button class="secondary" id="openDebug">Open /debug</button>
+            </div>
+            <div id="debugError" class="err"></div>
+            <div id="debugOk" class="ok"></div>
+          </div>
+
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
