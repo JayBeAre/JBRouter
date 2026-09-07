@@ -1,5 +1,20 @@
-import { j, aerr, cleanHeaders } from './config.js';
+import { j, aerr, cleanHeaders, packToolCallId, unpackToolCallId } from './config.js';
 import { providers, pools, rolemap, routerAuth } from './providers.js';
+
+/*
+ * Per-provider-call timeout. Without this, a single slow or
+ * hung provider can stall the whole request (and every
+ * fallback behind it) far longer than is ever useful.
+ */
+const PROVIDER_TIMEOUT_MS = 20000;
+
+/*
+ * Hard ceiling on how long the ENTIRE router (across every pool
+ * in the fallback chain) is allowed to keep trying before giving
+ * up and returning an error. This bounds worst-case latency
+ * regardless of how many pools/entries are configured.
+ */
+const ROUTER_BUDGET_MS = 45000;
 
 function blockText(p) {
   if (!p) return "";
@@ -24,7 +39,17 @@ function toOpenAIMessages(ms) {
       for (const p of m.content || []) {
         if (!p) continue;
         if (p.type === "text") t.push(p.text || "");
-        else if (p.type === "tool_result") tr.push({ role: "tool", tool_call_id: p.tool_use_id, content: typeof p.content === "string" ? p.content : JSON.stringify(p.content ?? "") });
+        else if (p.type === "tool_result") {
+          /*
+           * p.tool_use_id may be a "packed" id containing
+           * round-tripped vendor metadata (see
+           * packToolCallId/unpackToolCallId in config.ts). Only
+           * the REAL id should go upstream — the provider has no
+           * idea about our packing scheme.
+           */
+          const { id: realToolCallId } = unpackToolCallId(p.tool_use_id);
+          tr.push({ role: "tool", tool_call_id: realToolCallId || p.tool_use_id, content: typeof p.content === "string" ? p.content : JSON.stringify(p.content ?? "") });
+        }
         else t.push(blockText(p));
       }
       if (t.length) out.push({ role: "user", content: t.join("\n") });
@@ -36,7 +61,18 @@ function toOpenAIMessages(ms) {
       for (const p of m.content || []) {
         if (!p) continue;
         if (p.type === "text") t.push(p.text || "");
-        else if (p.type === "tool_use") tc.push({ id: p.id || `tool_${crypto.randomUUID()}`, type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } });
+        else if (p.type === "tool_use") {
+          /*
+           * Unpack any vendor metadata (e.g. Gemini's
+           * thought_signature) stashed in the id when this tool
+           * call was first returned to Claude, and re-attach it
+           * so the provider recognizes its own history.
+           */
+          const { id: realId, extraContent } = unpackToolCallId(p.id || "");
+          const call = { id: realId || `tool_${crypto.randomUUID()}`, type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } };
+          if (extraContent) call.extra_content = extraContent;
+          tc.push(call);
+        }
         else t.push(blockText(p));
       }
       const x = { role: "assistant", content: t.length ? t.join("\n") : null };
@@ -82,7 +118,14 @@ function fromOpenAI(r, requested, backend) {
   for (const tc of m.tool_calls || []) {
     let input = {};
     try { input = JSON.parse(tc?.function?.arguments || "{}"); } catch {}
-    content.push({ type: "tool_use", id: tc.id || `tool_${crypto.randomUUID()}`, name: tc?.function?.name || "", input });
+    /*
+     * Round-trip any vendor-specific tool-call metadata (e.g.
+     * Gemini's extra_content.google.thought_signature) by packing
+     * it into the id we hand back to Claude.
+     */
+    const rawId = tc.id || `tool_${crypto.randomUUID()}`;
+    const packedId = packToolCallId(rawId, tc.extra_content || null);
+    content.push({ type: "tool_use", id: packedId, name: tc?.function?.name || "", input });
   }
   return { id: r.id || `msg_${crypto.randomUUID()}`, type: "message", role: "assistant", model: requested, content, stop_reason: c.finish_reason === "tool_calls" ? "tool_use" : c.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null, usage: { input_tokens: r?.usage?.prompt_tokens || 0, output_tokens: r?.usage?.completion_tokens || 0 }, _backend_model: backend };
 }
@@ -106,7 +149,7 @@ async function callProvider(provider, model, key, body, ms, tools) {
     const tc = toolChoice(body.tool_choice);
     if (tc !== undefined) payload.tool_choice = tc;
   }
-  return fetch(baseUrl, { method: "POST", headers: h, body: JSON.stringify(payload) });
+  return fetch(baseUrl, { method: "POST", headers: h, body: JSON.stringify(payload), signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
 }
 
 async function callWithKeys(provider, model, body, ms, tools) {
@@ -169,6 +212,18 @@ export async function router(request, env) {
   }
   let body;
   try { body = await request.json(); } catch { return aerr("Invalid JSON request body."); }
+
+  /*
+   * Reject malformed requests up front instead of forwarding an
+   * empty/garbage payload to every provider in the fallback
+   * chain — that wastes attempts and can trip a provider's own
+   * WAF (some return a blanket "Access denied by security
+   * policy" for empty-messages requests).
+   */
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return aerr('"messages" must be a non-empty array.', "invalid_request_error", 400);
+  }
+
   const requested = String(body.model || "default");
   const [ps, pls, rm] = await Promise.all([providers(env), pools(env), rolemap(env)]);
   const startPoolId = resolvePoolId(requested, rm, pls);
@@ -177,11 +232,19 @@ export async function router(request, env) {
   const tools = toOpenAITools(body.tools);
   let lastStatus = 503; let lastRetryAfter = null; const attempts = []; const visitedPools = new Set();
   let currentPoolId = startPoolId;
+  const routerStartedAt = Date.now();
+  let budgetExceeded = false;
   while (currentPoolId && !visitedPools.has(currentPoolId)) {
     visitedPools.add(currentPoolId);
     const pool = pls[currentPoolId];
     if (!pool || !Array.isArray(pool.entries) || !pool.entries.length) { currentPoolId = pool?.fallbackPoolId || null; continue; }
     for (let index = 0; index < pool.entries.length; index++) {
+      if (Date.now() - routerStartedAt > ROUTER_BUDGET_MS) {
+        attempts.push({ pool: currentPoolId, index, providerId: "-", model: "-", status: 504, error: "Router time budget exceeded." });
+        lastStatus = 504;
+        budgetExceeded = true;
+        break;
+      }
       const e = pool.entries[index];
       const providerId = String(e?.providerId || ""); const backendModel = String(e?.model || "");
       if (!providerId || !backendModel) { attempts.push({ pool: currentPoolId, index, providerId, model: backendModel, status: 400, error: "Invalid pool entry." }); lastStatus = 400; continue; }
@@ -200,6 +263,7 @@ export async function router(request, env) {
       if (body.stream === true) return new Response(sse(msg), { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...headers } });
       return j(msg, 200, headers);
     }
+    if (budgetExceeded) break;
     currentPoolId = pool.fallbackPoolId || null;
   }
   const summary = attempts.map((a) => { const poolTag = a.pool ? `[${a.pool}] ` : ""; const provider = a.providerId || "?"; const model = a.model || "?"; const status = a.status || "?"; const error = a.error ? String(a.error).slice(0, 300) : ""; return `${poolTag}${provider}/${model} → ${status}` + (error ? ` → ${error}` : ""); }).join(" | ");

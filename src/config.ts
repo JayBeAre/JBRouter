@@ -98,6 +98,61 @@ export const eq = (a, b) => {
 
 export const mask = (k) => (!k || k.length < 4 ? "••••" : `••••${k.slice(-4)}`);
 
+/*
+ * ============================================================
+ * TOOL-CALL METADATA ROUND-TRIPPING
+ * ============================================================
+ *
+ * Some OpenAI-compatible providers (Gemini 3.x is the known case
+ * as of 2026) attach extra, non-standard metadata to each tool
+ * call they return — e.g.:
+ *
+ *   tool_calls[i].extra_content.google.thought_signature
+ *
+ * ...and then REQUIRE that exact value to be echoed back on the
+ * corresponding tool call when the conversation history is
+ * replayed on a later turn. If it's missing, the provider
+ * rejects the request ("Function call is missing a
+ * thought_signature" 400).
+ *
+ * Claude has no field for this, but it DOES treat tool_use.id as
+ * an opaque string and echoes it back byte-for-byte in the
+ * matching tool_result.tool_use_id. So we smuggle the metadata
+ * inside the id we hand back to Claude, and unpack it again
+ * whenever we rebuild an OpenAI-style request from history.
+ *
+ * This is intentionally generic, not Gemini-specific — any
+ * OpenAI-compatible provider that sends extra_content on a tool
+ * call gets this same round-tripping for free.
+ * ============================================================
+ */
+
+export const TC_ID_SEP = "::x::";
+
+export function packToolCallId(id, extraContent) {
+  if (!extraContent) return id;
+  try {
+    return id + TC_ID_SEP + btoa(JSON.stringify(extraContent));
+  } catch {
+    return id;
+  }
+}
+
+export function unpackToolCallId(packed) {
+  const raw = String(packed || "");
+  const idx = raw.indexOf(TC_ID_SEP);
+  if (idx === -1) return { id: raw, extraContent: null };
+  const id = raw.slice(0, idx);
+  const encoded = raw.slice(idx + TC_ID_SEP.length);
+  let extraContent = null;
+  try {
+    extraContent = JSON.parse(atob(encoded));
+  } catch {
+    extraContent = null;
+  }
+  return { id, extraContent };
+}
+
 export async function kvGet(env, key, def) {
   const v = await env.CONFIG_KV.get(key, "json");
   return v ?? def;
