@@ -68,6 +68,19 @@ export ANTHROPIC_BASE_URL="https://<your-worker>.workers.dev"
 export ANTHROPIC_AUTH_TOKEN="your-token" # only if enabled in Security tab
 ```
 
+## Environment Setup (PowerShell)
+To easily configure your client to point to your new worker, run the following commands in your PowerShell terminal:
+
+```powershell
+# Set your environment variables permanently (User level)
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://<YOUR_WORKER_URL>.workers.dev", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", "dummy", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-5", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-5", "User")
+```
+*Note: You must restart your terminal for these changes to take effect.*
+
 ## Notes
 
 - Provider API keys are stored in KV.
