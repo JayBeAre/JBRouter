@@ -75,6 +75,7 @@ To easily configure your client to point to your new worker, run the following c
 # Set your environment variables permanently (User level)
 [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://<YOUR_WORKER_URL>.workers.dev", "User")
 [Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", "dummy", "User")
+# OR in case you've configured and enabled the "Router API authentication" --> [Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN",<Bearer token Here in double quotation>, "User")
 [Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5", "User")
 [Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-5", "User")
 [Environment]::SetEnvironmentVariable("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-5", "User")

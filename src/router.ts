@@ -2,19 +2,26 @@ import { j, aerr, cleanHeaders, packToolCallId, unpackToolCallId } from './confi
 import { providers, pools, rolemap, routerAuth } from './providers.js';
 
 /*
- * Per-provider-call timeout. Without this, a single slow or
- * hung provider can stall the whole request (and every
- * fallback behind it) far longer than is ever useful.
+ * Per-provider-call timeout. This has to be generous: Gemini's
+ * reasoning models can legitimately take 30-50+ seconds to
+ * produce a full non-streamed response for a non-trivial prompt
+ * (we always request stream:false upstream and buffer the whole
+ * reply before converting it, so the client sees nothing until
+ * this finishes). Too short a timeout kills real, working
+ * requests — which is what a 20s value was doing. This is meant
+ * to catch a genuinely hung connection, not a slow-but-alive one.
  */
-const PROVIDER_TIMEOUT_MS = 20000;
+const PROVIDER_TIMEOUT_MS = 55000;
 
 /*
  * Hard ceiling on how long the ENTIRE router (across every pool
  * in the fallback chain) is allowed to keep trying before giving
- * up and returning an error. This bounds worst-case latency
- * regardless of how many pools/entries are configured.
+ * up. Must be comfortably larger than PROVIDER_TIMEOUT_MS so a
+ * single slow-but-legitimate call isn't cut off mid-flight; this
+ * mainly bounds the case where MULTIPLE entries in the chain are
+ * each slow/failing in sequence.
  */
-const ROUTER_BUDGET_MS = 45000;
+const ROUTER_BUDGET_MS = 90000;
 
 function blockText(p) {
   if (!p) return "";
